@@ -121,6 +121,18 @@ impl TestServer {
             .to_string()
     }
 
+    async fn get_object_acl(&self, key: &str) -> String {
+        let response = self
+            .client
+            .get(format!("{}?acl", self.object_url(key)))
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.text().await.unwrap()
+    }
+
     async fn list(&self, prefix: &str, delimiter: Option<&str>) -> String {
         let mut request = self
             .client
@@ -153,16 +165,20 @@ impl TestServer {
     }
 
     async fn copy(&self, source_key: &str, destination_key: &str) {
-        let payload = self.read(source_key).await;
         let response = self
             .client
             .put(self.object_url(destination_key))
             .header("Authorization", &self.auth_header)
-            .body(payload)
+            .header(
+                "x-amz-copy-source",
+                format!("/{}/{}", self.bucket, source_key),
+            )
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("<CopyObjectResult>"));
     }
 
     async fn rename(&self, source_key: &str, destination_key: &str) {
@@ -285,4 +301,20 @@ async fn md5_is_computed_from_object_body_not_etag() {
     assert_eq!(actual_md5, expected_md5);
     assert_ne!(actual_etag, expected_md5);
     assert!(actual_etag.contains('-'));
+}
+
+#[tokio::test]
+async fn copy_object_and_acl_probe_are_s3_compatible() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("copy-source.txt");
+
+    fs::write(&source_file, b"copy me").await.unwrap();
+    server.write("copy/source.txt", &source_file).await;
+
+    let acl_xml = server.get_object_acl("copy/source.txt").await;
+    assert!(acl_xml.contains("<AccessControlPolicy>"));
+    assert!(acl_xml.contains("<Permission>FULL_CONTROL</Permission>"));
+
+    server.copy("copy/source.txt", "copy/target.txt").await;
+    assert_eq!(server.read("copy/target.txt").await, b"copy me");
 }

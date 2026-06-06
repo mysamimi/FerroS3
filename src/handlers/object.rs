@@ -1,10 +1,11 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{OriginalUri, Path, State},
     http::{header, StatusCode, HeaderMap},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::fs::{self, File};
@@ -16,8 +17,61 @@ use crate::cache::CachedStat;
 use crate::error::S3ErrorType;
 use futures_util::StreamExt;
 
+#[derive(Serialize)]
+#[serde(rename = "CopyObjectResult")]
+struct CopyObjectResult {
+    #[serde(rename = "LastModified")]
+    last_modified: String,
+    #[serde(rename = "ETag")]
+    etag: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename = "AccessControlPolicy")]
+struct AccessControlPolicy {
+    #[serde(rename = "Owner")]
+    owner: AclOwner,
+    #[serde(rename = "AccessControlList")]
+    access_control_list: AccessControlList,
+}
+
+#[derive(Serialize)]
+struct AclOwner {
+    #[serde(rename = "ID")]
+    id: String,
+    #[serde(rename = "DisplayName")]
+    display_name: String,
+}
+
+#[derive(Serialize)]
+struct AccessControlList {
+    #[serde(rename = "Grant")]
+    grants: Vec<Grant>,
+}
+
+#[derive(Serialize)]
+struct Grant {
+    #[serde(rename = "Grantee")]
+    grantee: Grantee,
+    #[serde(rename = "Permission")]
+    permission: String,
+}
+
+#[derive(Serialize)]
+struct Grantee {
+    #[serde(rename = "@xmlns:xsi")]
+    xmlns_xsi: String,
+    #[serde(rename = "@xsi:type")]
+    xsi_type: String,
+    #[serde(rename = "ID")]
+    id: String,
+    #[serde(rename = "DisplayName")]
+    display_name: String,
+}
+
 pub async fn get_object(
     Path((bucket, key)): Path<(String, String)>,
+    uri: OriginalUri,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
@@ -45,6 +99,10 @@ pub async fn get_object(
     let size = metadata.len();
     let mod_time: DateTime<Utc> = metadata.modified().unwrap_or(SystemTime::now()).into();
     let etag = format!("\"{:x}-{:x}\"", mod_time.timestamp_nanos_opt().unwrap_or(0), size);
+
+    if has_acl_query(uri.0.query()) {
+        return object_acl_response();
+    }
 
     // Handle Range Header
     if let Some(range_header) = headers.get(header::RANGE).and_then(|h| h.to_str().ok()) {
@@ -134,6 +192,7 @@ pub async fn head_object(
 pub async fn put_object(
     Path((bucket, key)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Body,
 ) -> Response {
     let key = match decode(&key) {
@@ -147,7 +206,14 @@ pub async fn put_object(
     };
 
     let path = storage.join(key.trim_start_matches('/'));
-    
+
+    if let Some(copy_source) = headers
+        .get("x-amz-copy-source")
+        .and_then(|value| value.to_str().ok())
+    {
+        return copy_object(&state, &bucket, &key, &path, copy_source).await;
+    }
+
     // Create parent directories
     if let Some(parent) = path.parent() {
         if let Err(_) = fs::create_dir_all(parent).await {
@@ -176,6 +242,66 @@ pub async fn put_object(
     state.cache.remove(&format!("{}/{}", bucket, key));
 
     StatusCode::OK.into_response()
+}
+
+async fn copy_object(
+    state: &Arc<AppState>,
+    destination_bucket: &str,
+    destination_key: &str,
+    destination_path: &std::path::Path,
+    copy_source: &str,
+) -> Response {
+    let (source_bucket, source_key) = match parse_copy_source(copy_source) {
+        Some(source) => source,
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let source_storage = match state.storage_map.get(&source_bucket) {
+        Some(storage) => storage,
+        None => return S3ErrorType::NoSuchBucket.to_response(Some(source_bucket)),
+    };
+
+    let source_path = source_storage.join(source_key.trim_start_matches('/'));
+    let source_metadata = match fs::metadata(&source_path).await {
+        Ok(metadata) if !metadata.is_dir() => metadata,
+        Ok(_) => return S3ErrorType::NoSuchKey.to_response(Some(source_key)),
+        Err(_) => return S3ErrorType::NoSuchKey.to_response(Some(source_key)),
+    };
+
+    if let Some(parent) = destination_path.parent() {
+        if let Err(_) = fs::create_dir_all(parent).await {
+            return S3ErrorType::InternalError.to_response(None);
+        }
+    }
+
+    if let Err(_) = fs::copy(&source_path, destination_path).await {
+        return S3ErrorType::InternalError.to_response(None);
+    }
+
+    state
+        .cache
+        .remove(&format!("{}/{}", destination_bucket, destination_key));
+
+    let mod_time: DateTime<Utc> = source_metadata
+        .modified()
+        .unwrap_or(SystemTime::now())
+        .into();
+    let etag = format!(
+        "\"{:x}-{:x}\"",
+        mod_time.timestamp_nanos_opt().unwrap_or(0),
+        source_metadata.len()
+    );
+    let result = CopyObjectResult {
+        last_modified: mod_time.to_rfc3339(),
+        etag,
+    };
+
+    let xml = quick_xml::se::to_string(&result).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(xml))
+        .unwrap()
 }
 
 pub async fn delete_object(
@@ -220,4 +346,48 @@ fn parse_range(range_header: &str, file_size: u64) -> Option<(u64, u64)> {
     } else {
         None
     }
+}
+
+fn has_acl_query(query: Option<&str>) -> bool {
+    query
+        .map(|value| value.split('&').any(|part| part == "acl" || part.starts_with("acl=")))
+        .unwrap_or(false)
+}
+
+fn object_acl_response() -> Response {
+    let response = AccessControlPolicy {
+        owner: AclOwner {
+            id: owner_id(),
+            display_name: "Owner".to_string(),
+        },
+        access_control_list: AccessControlList {
+            grants: vec![Grant {
+                grantee: Grantee {
+                    xmlns_xsi: "http://www.w3.org/2001/XMLSchema-instance".to_string(),
+                    xsi_type: "CanonicalUser".to_string(),
+                    id: owner_id(),
+                    display_name: "Owner".to_string(),
+                },
+                permission: "FULL_CONTROL".to_string(),
+            }],
+        },
+    };
+
+    let xml = quick_xml::se::to_string(&response).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(xml))
+        .unwrap()
+}
+
+fn parse_copy_source(copy_source: &str) -> Option<(String, String)> {
+    let decoded = urlencoding::decode(copy_source).ok()?.into_owned();
+    let trimmed = decoded.trim_start_matches('/');
+    let (bucket, key) = trimmed.split_once('/')?;
+    Some((bucket.to_string(), key.to_string()))
+}
+
+fn owner_id() -> String {
+    "75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a".to_string()
 }
