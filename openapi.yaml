@@ -1,0 +1,308 @@
+openapi: 3.0.3
+info:
+  title: FerroS3 API
+  version: 0.1.0
+  description: S3-compatible filesystem-backed proxy for local directories.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local default
+tags:
+  - name: Buckets
+  - name: Objects
+  - name: Admin
+paths:
+  /:
+    get:
+      tags: [Buckets]
+      summary: List configured buckets
+      description: Returns the buckets configured in `config.yaml`.
+      responses:
+        '200':
+          description: Bucket list in XML
+          content:
+            application/xml:
+              schema:
+                type: string
+              example: |
+                <ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Owner>
+                    <ID>75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a</ID>
+                    <DisplayName>Owner</DisplayName>
+                  </Owner>
+                  <Buckets>
+                    <Bucket>
+                      <Name>my-bucket</Name>
+                      <CreationDate>2006-02-03T16:45:09.000Z</CreationDate>
+                    </Bucket>
+                  </Buckets>
+                </ListAllMyBucketsResult>
+        '403':
+          $ref: '#/components/responses/S3AccessDenied'
+  /{bucket}:
+    head:
+      tags: [Buckets]
+      summary: Check whether a bucket exists
+      parameters:
+        - $ref: '#/components/parameters/Bucket'
+      responses:
+        '200':
+          description: Bucket exists
+        '404':
+          $ref: '#/components/responses/S3NoSuchBucket'
+        '403':
+          $ref: '#/components/responses/S3AccessDenied'
+  /{bucket}/:
+    get:
+      tags: [Objects]
+      summary: List objects in a bucket
+      parameters:
+        - $ref: '#/components/parameters/Bucket'
+        - name: prefix
+          in: query
+          schema:
+            type: string
+          description: Return only keys that start with this prefix.
+        - name: delimiter
+          in: query
+          schema:
+            type: string
+          description: Group keys by delimiter and emit common prefixes.
+        - name: marker
+          in: query
+          schema:
+            type: string
+          description: Accepted for compatibility and echoed back in the response.
+        - name: max-keys
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Maximum number of objects to return. Defaults to 1000.
+        - name: list-type
+          in: query
+          schema:
+            type: integer
+            enum: [1, 2]
+          description: Accepts 2 for the simplified ListObjectsV2-compatible mode.
+        - name: continuation-token
+          in: query
+          schema:
+            type: string
+          description: Accepted for compatibility and echoed back in the response.
+      responses:
+        '200':
+          description: Bucket listing in XML
+          content:
+            application/xml:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/S3NoSuchBucket'
+        '403':
+          $ref: '#/components/responses/S3AccessDenied'
+  /{bucket}/{key}:
+    get:
+      tags: [Objects]
+      summary: Download an object
+      parameters:
+        - $ref: '#/components/parameters/Bucket'
+        - $ref: '#/components/parameters/Key'
+        - name: Range
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Supports bytes ranges such as `bytes=0-99` or `bytes=100-`.
+      responses:
+        '200':
+          description: Object body
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '206':
+          description: Partial object body
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadKey'
+        '404':
+          $ref: '#/components/responses/S3NoSuchKey'
+        '403':
+          $ref: '#/components/responses/S3AccessDenied'
+    head:
+      tags: [Objects]
+      summary: Fetch object metadata
+      parameters:
+        - $ref: '#/components/parameters/Bucket'
+        - $ref: '#/components/parameters/Key'
+      responses:
+        '200':
+          description: Object metadata
+        '400':
+          $ref: '#/components/responses/BadKey'
+        '404':
+          $ref: '#/components/responses/S3NoSuchKey'
+        '403':
+          $ref: '#/components/responses/S3AccessDenied'
+    put:
+      tags: [Objects]
+      summary: Upload or replace an object
+      parameters:
+        - $ref: '#/components/parameters/Bucket'
+        - $ref: '#/components/parameters/Key'
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Object stored successfully
+        '400':
+          $ref: '#/components/responses/BadKey'
+        '404':
+          $ref: '#/components/responses/S3NoSuchBucket'
+        '500':
+          $ref: '#/components/responses/S3InternalError'
+        '403':
+          $ref: '#/components/responses/S3AccessDenied'
+    delete:
+      tags: [Objects]
+      summary: Delete an object
+      parameters:
+        - $ref: '#/components/parameters/Bucket'
+        - $ref: '#/components/parameters/Key'
+      responses:
+        '204':
+          description: Object deleted or already missing
+        '400':
+          $ref: '#/components/responses/BadKey'
+        '404':
+          $ref: '#/components/responses/S3NoSuchBucket'
+        '403':
+          $ref: '#/components/responses/S3AccessDenied'
+  /_admin/presign:
+    post:
+      tags: [Admin]
+      summary: Generate a presigned URL
+      description: Generates a presigned URL using the configured access key and secret key.
+      parameters:
+        - name: bucket
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: key
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: method
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [GET, PUT, HEAD, DELETE]
+        - name: expires
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+          description: Expiration time in seconds.
+      responses:
+        '200':
+          description: Presigned URL
+          content:
+            text/plain:
+              schema:
+                type: string
+        '500':
+          description: Auth is not configured
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: Auth not configured
+components:
+  parameters:
+    Bucket:
+      name: bucket
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Bucket name defined in `config.yaml`.
+    Key:
+      name: key
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Object key. URL-encode reserved characters when needed.
+      allowReserved: true
+  responses:
+    BadKey:
+      description: Bad object key encoding
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: Bad Request
+    S3AccessDenied:
+      description: Access denied
+      content:
+        application/xml:
+          schema:
+            type: string
+          example: |
+            <Error>
+              <Code>AccessDenied</Code>
+              <Message>Access Denied.</Message>
+              <RequestId>...</RequestId>
+            </Error>
+    S3NoSuchBucket:
+      description: Bucket not found
+      content:
+        application/xml:
+          schema:
+            type: string
+          example: |
+            <Error>
+              <Code>NoSuchBucket</Code>
+              <Message>The specified bucket does not exist.</Message>
+              <Resource>my-bucket</Resource>
+              <RequestId>...</RequestId>
+            </Error>
+    S3NoSuchKey:
+      description: Object not found
+      content:
+        application/xml:
+          schema:
+            type: string
+          example: |
+            <Error>
+              <Code>NoSuchKey</Code>
+              <Message>The specified key does not exist.</Message>
+              <Resource>path/to/file.txt</Resource>
+              <RequestId>...</RequestId>
+            </Error>
+    S3InternalError:
+      description: Internal server error
+      content:
+        application/xml:
+          schema:
+            type: string
+          example: |
+            <Error>
+              <Code>InternalError</Code>
+              <Message>An internal error occurred.</Message>
+              <RequestId>...</RequestId>
+            </Error>

@@ -8,8 +8,9 @@ use serde::Serialize;
 use std::sync::Arc;
 use crate::state::AppState;
 use crate::error::S3ErrorType;
+use utoipa::ToSchema;
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 #[serde(rename = "ListAllMyBucketsResult")]
 pub struct ListAllMyBucketsResult {
     #[serde(rename = "@xmlns")]
@@ -20,7 +21,7 @@ pub struct ListAllMyBucketsResult {
     pub buckets: Vec<Bucket>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct Owner {
     #[serde(rename = "ID")]
     pub id: String,
@@ -28,7 +29,7 @@ pub struct Owner {
     pub display_name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct Bucket {
     #[serde(rename = "Name")]
     pub name: String,

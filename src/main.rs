@@ -4,6 +4,7 @@ mod state;
 mod error;
 mod handlers;
 mod auth;
+mod openapi;
 
 use axum::{
     middleware,
@@ -61,7 +62,7 @@ fn build_state(config: &Config) -> Arc<AppState> {
     })
 }
 
-fn build_app(state: Arc<AppState>) -> Router {
+fn build_api_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(list_buckets))
         .route("/_admin/presign", axum::routing::post(generate_presigned_url))
@@ -69,6 +70,23 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/:bucket/*key", get(get_object).head(head_object).put(put_object).delete(delete_object))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
+}
+
+#[cfg(debug_assertions)]
+fn build_docs_router() -> Router {
+    Router::new()
+        .route("/openapi.json", get(crate::openapi::openapi_json))
+        .route("/docs", get(crate::openapi::swagger_ui_html))
+        .route("/docs/", get(crate::openapi::swagger_ui_html))
+}
+
+fn build_app(state: Arc<AppState>) -> Router {
+    let app = Router::new().merge(build_api_router(state));
+
+    #[cfg(debug_assertions)]
+    let app = app.merge(build_docs_router());
+
+    app
 }
 
 #[cfg(not(target_os = "freebsd"))]
@@ -255,8 +273,17 @@ mod tests {
     use tower::util::ServiceExt;
     use crate::config::{BucketConfig, AuthConfig};
     use axum::body::Body;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn setup_test_state() -> Arc<AppState> {
+    fn test_storage_dir(test_name: &str) -> PathBuf {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        PathBuf::from(format!("./test_data_{}_{}", test_name, unique_suffix))
+    }
+
+    fn setup_test_state(storage_dir: &PathBuf) -> Arc<AppState> {
         let config = Config {
             port: 8080,
             endpoint: "0.0.0.0".to_string(),
@@ -268,12 +295,12 @@ mod tests {
             }),
             buckets: vec![BucketConfig {
                 name: "test_bucket".to_string(),
-                storage: "./test_data".to_string(),
+                storage: storage_dir.to_string_lossy().to_string(),
             }],
         };
 
         let mut storage_map = HashMap::new();
-        storage_map.insert("test_bucket".to_string(), PathBuf::from("./test_data"));
+        storage_map.insert("test_bucket".to_string(), storage_dir.clone());
 
         Arc::new(AppState {
             config,
@@ -284,7 +311,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_failure() {
-        let state = setup_test_state();
+        let storage_dir = test_storage_dir("auth_failure");
+        let state = setup_test_state(&storage_dir);
         let app = Router::new()
             .route("/:bucket/", get(list_objects))
             .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
@@ -300,14 +328,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_success() {
-        let state = setup_test_state();
+        let storage_dir = test_storage_dir("auth_success");
+        let state = setup_test_state(&storage_dir);
         let app = Router::new()
             .route("/:bucket/", get(list_objects))
             .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
             .with_state(state);
 
         // Create test directory if not exists
-        fs::create_dir_all("./test_data").await.unwrap();
+        fs::create_dir_all(&storage_dir).await.unwrap();
 
         let response = app
             .oneshot(
@@ -323,17 +352,18 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         
         // Clean up
-        let _ = fs::remove_dir_all("./test_data").await;
+        let _ = fs::remove_dir_all(&storage_dir).await;
     }
 
     #[tokio::test]
     async fn test_put_and_delete_object() {
-        let state = setup_test_state();
+        let storage_dir = test_storage_dir("put_and_delete_object");
+        let state = setup_test_state(&storage_dir);
         let app = Router::new()
             .route("/:bucket/*key", get(get_object).put(put_object).delete(delete_object))
             .with_state(state);
 
-        fs::create_dir_all("./test_data").await.unwrap();
+        fs::create_dir_all(&storage_dir).await.unwrap();
 
         // 1. Put Object
         let response = app.clone()
@@ -349,7 +379,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // Verify file exists
-        assert!(fs::metadata("./test_data/new_file.txt").await.is_ok());
+        assert!(fs::metadata(storage_dir.join("new_file.txt")).await.is_ok());
 
         // 2. Delete Object
         let response = app
@@ -365,9 +395,22 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         // Verify file is gone
-        assert!(fs::metadata("./test_data/new_file.txt").await.is_err());
+        assert!(fs::metadata(storage_dir.join("new_file.txt")).await.is_err());
 
         // Clean up
-        let _ = fs::remove_dir_all("./test_data").await;
+        let _ = fs::remove_dir_all(&storage_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_openapi_route_is_available() {
+        let storage_dir = test_storage_dir("openapi_route");
+        let app = build_app(setup_test_state(&storage_dir));
+
+        let response = app
+            .oneshot(Request::builder().uri("/openapi.json").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

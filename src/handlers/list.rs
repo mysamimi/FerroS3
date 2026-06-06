@@ -10,20 +10,28 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use crate::state::AppState;
 use crate::error::S3ErrorType;
+use utoipa::{IntoParams, ToSchema};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams, ToSchema)]
+#[into_params(parameter_in = Query)]
 #[serde(rename_all = "kebab-case")]
 pub struct ListObjectsParams {
+    /// Only return object keys that start with this prefix.
     pub prefix: Option<String>,
+    /// Use a delimiter to group common prefixes.
     pub delimiter: Option<String>,
+    /// Compatibility marker for legacy list requests.
     pub marker: Option<String>,
+    /// Maximum number of keys to return.
     pub max_keys: Option<usize>,
+    /// Use `2` to request the simplified ListObjectsV2-compatible mode.
     #[serde(rename = "list-type")]
     pub list_type: Option<u8>,
+    /// Compatibility token accepted by the simplified V2 mode.
     pub continuation_token: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 #[serde(rename = "ListBucketResult")]
 pub struct ListBucketResult {
     #[serde(rename = "@xmlns")]
@@ -55,7 +63,7 @@ pub struct ListBucketResult {
     pub next_continuation_token: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct ObjectContent {
     #[serde(rename = "Key")]
     pub key: String,
@@ -69,7 +77,7 @@ pub struct ObjectContent {
     pub storage_class: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct CommonPrefix {
     #[serde(rename = "Prefix")]
     pub prefix: String,

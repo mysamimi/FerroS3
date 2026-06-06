@@ -4,8 +4,9 @@ use axum::{
 };
 use serde::Serialize;
 use quick_xml::se::to_string;
+use utoipa::ToSchema;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(rename = "Error")]
 pub struct S3Error {
     #[serde(rename = "Code")]

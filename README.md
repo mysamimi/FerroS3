@@ -52,6 +52,18 @@ buckets:
     storage: "/path/to/local/data"
 ```
 
+## 📚 API Documentation
+
+- Available only in non-production builds (`cargo run` / debug builds).
+- Live Swagger UI: `http://127.0.0.1:8080/docs`
+- Live OpenAPI JSON: `http://127.0.0.1:8080/openapi.json`
+- Human-readable API reference: [API.md](./API.md)
+- Static OpenAPI file: [openapi.yaml](./openapi.yaml)
+
+Swagger UI uses HTTP Basic auth:
+- Username: `access_key`
+- Password: `secret_key`
+
 ## 🏗️ Cross-Compilation (FreeBSD/Linux)
 
 ### Modern Targets (Linux & FreeBSD 12+)
