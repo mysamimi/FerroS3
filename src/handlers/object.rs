@@ -106,21 +106,31 @@ pub async fn get_object(
 
     // Handle Range Header
     if let Some(range_header) = headers.get(header::RANGE).and_then(|h| h.to_str().ok()) {
-        if let Some(range) = parse_range(range_header, size) {
-            let (start, end) = range;
-            let range_size = end - start + 1;
-            
-            if file.seek(io::SeekFrom::Start(start)).await.is_ok() {
-                let stream = ReaderStream::new(file.take(range_size));
+        match parse_range(range_header, size) {
+            RangeRequest::Satisfiable(start, end) => {
+                let range_size = end - start + 1;
+                if file.seek(io::SeekFrom::Start(start)).await.is_ok() {
+                    let stream = ReaderStream::new(file.take(range_size));
+                    return Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CONTENT_LENGTH, range_size)
+                        .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, size))
+                        .header(header::ETAG, etag)
+                        .header("Last-Modified", mod_time.to_rfc2822())
+                        .body(Body::from_stream(stream))
+                        .unwrap();
+                }
+            }
+            RangeRequest::Unsatisfiable => {
                 return Response::builder()
-                    .status(StatusCode::PARTIAL_CONTENT)
-                    .header(header::CONTENT_TYPE, "application/octet-stream")
-                    .header(header::CONTENT_LENGTH, range_size)
-                    .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, size))
-                    .header(header::ETAG, etag)
-                    .header("Last-Modified", mod_time.to_rfc2822())
-                    .body(Body::from_stream(stream))
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+                    .body(Body::empty())
                     .unwrap();
+            }
+            RangeRequest::Invalid => {
+                // Fallthrough to standard 200 OK
             }
         }
     }
@@ -328,23 +338,92 @@ pub async fn delete_object(
     StatusCode::NO_CONTENT.into_response()
 }
 
-fn parse_range(range_header: &str, file_size: u64) -> Option<(u64, u64)> {
-    if !range_header.starts_with("bytes=") { return None; }
+enum RangeRequest {
+    Satisfiable(u64, u64),
+    Unsatisfiable,
+    Invalid,
+}
+
+fn parse_range(range_header: &str, file_size: u64) -> RangeRequest {
+    if !range_header.starts_with("bytes=") { return RangeRequest::Invalid; }
     let range_str = &range_header[6..];
     let parts: Vec<&str> = range_str.split('-').collect();
-    if parts.len() != 2 { return None; }
+    if parts.len() != 2 { return RangeRequest::Invalid; }
 
-    let start = parts[0].parse::<u64>().ok()?;
-    let end = if parts[1].is_empty() {
-        file_size - 1
-    } else {
-        parts[1].parse::<u64>().ok()?
+    let start_str = parts[0].trim();
+    let end_str = parts[1].trim();
+
+    if start_str.is_empty() && end_str.is_empty() {
+        return RangeRequest::Invalid;
+    }
+
+    if start_str.is_empty() {
+        // Suffix range
+        let Ok(suffix_len) = end_str.parse::<u64>() else {
+            return RangeRequest::Invalid;
+        };
+        if suffix_len == 0 {
+            return RangeRequest::Invalid;
+        }
+        if file_size == 0 {
+            return RangeRequest::Unsatisfiable;
+        }
+        let start = file_size.saturating_sub(suffix_len);
+        let end = file_size - 1;
+        return RangeRequest::Satisfiable(start, end);
+    }
+
+    let Ok(start) = start_str.parse::<u64>() else {
+        return RangeRequest::Invalid;
     };
 
-    if start <= end && end < file_size {
-        Some((start, end))
+    if start >= file_size {
+        return RangeRequest::Unsatisfiable;
+    }
+
+    let end = if end_str.is_empty() {
+        file_size.saturating_sub(1)
     } else {
-        None
+        let Ok(parsed_end) = end_str.parse::<u64>() else {
+            return RangeRequest::Invalid;
+        };
+        std::cmp::min(parsed_end, file_size.saturating_sub(1))
+    };
+
+    if start <= end {
+        RangeRequest::Satisfiable(start, end)
+    } else {
+        RangeRequest::Invalid
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_range() {
+        // Normal ranges
+        assert!(matches!(parse_range("bytes=0-499", 1000), RangeRequest::Satisfiable(0, 499)));
+        assert!(matches!(parse_range("bytes=500-", 1000), RangeRequest::Satisfiable(500, 999)));
+        
+        // Suffix ranges
+        assert!(matches!(parse_range("bytes=-500", 1000), RangeRequest::Satisfiable(500, 999)));
+        assert!(matches!(parse_range("bytes=-1500", 1000), RangeRequest::Satisfiable(0, 999)));
+
+        // Unsatisfiable
+        assert!(matches!(parse_range("bytes=1000-", 1000), RangeRequest::Unsatisfiable));
+        assert!(matches!(parse_range("bytes=9999-", 1000), RangeRequest::Unsatisfiable));
+        
+        // Zero length files
+        assert!(matches!(parse_range("bytes=-500", 0), RangeRequest::Unsatisfiable));
+        assert!(matches!(parse_range("bytes=0-", 0), RangeRequest::Unsatisfiable));
+
+        // Invalid ranges
+        assert!(matches!(parse_range("bytes=abc-def", 1000), RangeRequest::Invalid));
+        assert!(matches!(parse_range("bytes=-", 1000), RangeRequest::Invalid));
+        assert!(matches!(parse_range("bytes=500-499", 1000), RangeRequest::Invalid));
+        assert!(matches!(parse_range("wrong=0-100", 1000), RangeRequest::Invalid));
     }
 }
 
