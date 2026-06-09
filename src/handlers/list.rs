@@ -101,6 +101,7 @@ pub async fn list_objects(
     let mut common_prefixes = std::collections::BTreeSet::new();
     
     let mut walker = walkdir::WalkDir::new(storage).into_iter();
+    let mut is_truncated = false;
 
     while let Some(Ok(entry)) = walker.next() {
         if entry.file_type().is_dir() {
@@ -119,10 +120,20 @@ pub async fn list_objects(
             let relative_to_prefix = &key[prefix.len()..];
             if let Some(idx) = relative_to_prefix.find(d) {
                 let common_prefix = format!("{}{}{}", prefix, &relative_to_prefix[..idx], d);
-                common_prefixes.insert(common_prefix);
-                walker.skip_current_dir(); // Optimization
+                if !common_prefixes.contains(&common_prefix) {
+                    if contents.len() + common_prefixes.len() >= max_keys {
+                        is_truncated = true;
+                        break;
+                    }
+                    common_prefixes.insert(common_prefix);
+                }
                 continue;
             }
+        }
+
+        if contents.len() + common_prefixes.len() >= max_keys {
+            is_truncated = true;
+            break;
         }
 
         let metadata = entry.metadata().unwrap();
@@ -136,26 +147,24 @@ pub async fn list_objects(
             size: metadata.len(),
             storage_class: "STANDARD".to_string(),
         });
-
-        if contents.len() >= max_keys {
-            break;
-        }
     }
+
+    let key_count = contents.len() + common_prefixes.len();
 
     let result = ListBucketResult {
         xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
         name: bucket,
         prefix,
         marker: params.marker,
-        next_marker: None,
+        next_marker: None, // Intentional: true pagination to be implemented later
         max_keys,
         delimiter,
-        is_truncated: false,
+        is_truncated,
         contents,
         common_prefixes: common_prefixes.into_iter().map(|p| CommonPrefix { prefix: p }).collect(),
-        key_count: if params.list_type == Some(2) { Some(0) } else { None }, // Simplified
+        key_count: if params.list_type == Some(2) { Some(key_count) } else { None },
         continuation_token: params.continuation_token,
-        next_continuation_token: None,
+        next_continuation_token: None, // Intentional: true pagination to be implemented later
     };
 
     let xml = quick_xml::se::to_string(&result).unwrap();
