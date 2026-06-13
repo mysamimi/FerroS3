@@ -8,6 +8,9 @@ build:
 	cargo build --release
 
 # Requires 'cross' tool: cargo install cross --git https://github.com/cross-rs/cross.git
+build-freebsd11:
+	./build-freebsd11.sh
+
 build-freebsd:
 	cross build --release --target x86_64-unknown-freebsd
 

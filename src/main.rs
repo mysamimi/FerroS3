@@ -3,6 +3,8 @@ use ferros3::{build_app, build_state, load_config};
 #[cfg(target_os = "freebsd")]
 use axum::body::{to_bytes, Body};
 #[cfg(target_os = "freebsd")]
+use axum::Router;
+#[cfg(target_os = "freebsd")]
 use axum::response::IntoResponse;
 #[cfg(target_os = "freebsd")]
 use http::{HeaderName, HeaderValue, Method, Request, StatusCode};
