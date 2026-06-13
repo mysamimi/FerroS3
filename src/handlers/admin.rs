@@ -9,15 +9,21 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use crate::state::AppState;
+use utoipa::IntoParams;
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PresignParams {
+    /// Target bucket name.
     pub bucket: String,
+    /// Object key to sign.
     pub key: String,
+    /// HTTP method to allow for the presigned URL.
     pub method: String,
-    pub expires: u64, // seconds
+    /// Expiration time in seconds.
+    pub expires: u64,
 }
 
 pub async fn generate_presigned_url(

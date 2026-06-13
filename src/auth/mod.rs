@@ -6,6 +6,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use base64::Engine;
 use std::sync::Arc;
 use std::collections::BTreeMap;
 use crate::state::AppState;
@@ -28,6 +29,14 @@ pub async fn auth_middleware(
     if let Some(auth) = auth_header {
         if auth.starts_with("AWS4-HMAC-SHA256") {
             return verify_header_auth(&state, req, &auth, &query_params, next).await;
+        }
+
+        if let Some((access_key, secret_key)) = parse_basic_auth(&auth) {
+            if let Some(auth_cfg) = &state.config.auth {
+                if auth_cfg.access_key == access_key && auth_cfg.secret_key == secret_key {
+                    return next.run(req).await;
+                }
+            }
         }
         
         // Fallback for simple access key matching (useful for tests and simple scripts)
@@ -189,4 +198,12 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
         }
     }
     map
+}
+
+fn parse_basic_auth(auth: &str) -> Option<(String, String)> {
+    let encoded = auth.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (access_key, secret_key) = decoded.split_once(':')?;
+    Some((access_key.to_string(), secret_key.to_string()))
 }

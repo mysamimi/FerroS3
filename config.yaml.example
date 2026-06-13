@@ -1,0 +1,10 @@
+port: 8080
+endpoint: "0.0.0.0"
+verbose: true
+cache_size: 10000
+auth:
+  access_key: "YOUR_ACCESS_KEY"
+  secret_key: "YOUR_SECRET_KEY"
+buckets:
+  - name: "my-bucket"
+    storage: "/path/to/local/data"
