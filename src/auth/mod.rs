@@ -38,13 +38,6 @@ pub async fn auth_middleware(
                 }
             }
         }
-        
-        // Fallback for simple access key matching (useful for tests and simple scripts)
-        if let Some(auth_cfg) = &state.config.auth {
-            if auth == auth_cfg.access_key {
-                return next.run(req).await;
-            }
-        }
     }
 
     if query_params.contains_key("X-Amz-Signature") {

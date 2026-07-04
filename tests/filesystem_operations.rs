@@ -51,7 +51,8 @@ impl TestServer {
             _source_dir: source_dir,
             bucket,
             base_url: format!("http://{}", address),
-            auth_header: "test_key".to_string(),
+            // Basic base64("test_key:test_secret")
+            auth_header: "Basic dGVzdF9rZXk6dGVzdF9zZWNyZXQ=".to_string(),
             client: Client::new(),
             handle,
         }
@@ -317,4 +318,46 @@ async fn copy_object_and_acl_probe_are_s3_compatible() {
 
     server.copy("copy/source.txt", "copy/target.txt").await;
     assert_eq!(server.read("copy/target.txt").await, b"copy me");
+}
+
+#[tokio::test]
+async fn bare_access_key_is_rejected_but_valid_basic_auth_passes() {
+    let server = TestServer::start().await;
+    let url = server.object_url("secured/object.txt");
+
+    // A bare access key (no secret) must NOT authenticate. The access key is public
+    // (it appears in every SigV4 Credential), so accepting it alone is a full bypass.
+    let bare_key = server
+        .client
+        .get(&url)
+        .header("Authorization", "test_key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare_key.status(), StatusCode::FORBIDDEN);
+
+    // The correct access key with a wrong secret must also be rejected.
+    let wrong_secret = server
+        .client
+        .get(&url)
+        .basic_auth("test_key", Some("not_the_secret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_secret.status(), StatusCode::FORBIDDEN);
+
+    // No credentials at all must be rejected.
+    let anonymous = server.client.get(&url).send().await.unwrap();
+    assert_eq!(anonymous.status(), StatusCode::FORBIDDEN);
+
+    // Valid Basic auth (access_key:secret_key) still works: 404 (not 403) proves it
+    // passed the auth layer and reached the handler for a missing object.
+    let valid = server
+        .client
+        .get(&url)
+        .basic_auth("test_key", Some("test_secret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), StatusCode::NOT_FOUND);
 }
