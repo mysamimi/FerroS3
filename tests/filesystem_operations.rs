@@ -318,3 +318,33 @@ async fn copy_object_and_acl_probe_are_s3_compatible() {
     server.copy("copy/source.txt", "copy/target.txt").await;
     assert_eq!(server.read("copy/target.txt").await, b"copy me");
 }
+
+#[tokio::test]
+async fn presigned_url_is_rejected_after_it_expires() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("exp.txt");
+    fs::write(&source_file, b"expiring").await.unwrap();
+    server.write("exp/object.txt", &source_file).await;
+
+    // Presign a GET with a 1-second lifetime.
+    let presign = server
+        .client
+        .post(format!("{}/_admin/presign", server.base_url))
+        .header("Authorization", &server.auth_header)
+        .query(&[
+            ("bucket", server.bucket.as_str()),
+            ("key", "exp/object.txt"),
+            ("method", "GET"),
+            ("expires", "1"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(presign.status(), StatusCode::OK);
+    let url = presign.text().await.unwrap();
+
+    // Once the lifetime lapses, the (still perfectly-signed) URL must be rejected.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let expired = server.client.get(&url).send().await.unwrap();
+    assert_eq!(expired.status(), StatusCode::FORBIDDEN);
+}
