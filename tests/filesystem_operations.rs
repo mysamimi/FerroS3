@@ -318,3 +318,23 @@ async fn copy_object_and_acl_probe_are_s3_compatible() {
     server.copy("copy/source.txt", "copy/target.txt").await;
     assert_eq!(server.read("copy/target.txt").await, b"copy me");
 }
+
+#[tokio::test]
+async fn list_buckets_nests_bucket_elements() {
+    let server = TestServer::start().await;
+    let response = server
+        .client
+        .get(format!("{}/", server.base_url))
+        .header("Authorization", &server.auth_header)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let xml = response.text().await.unwrap();
+
+    // S3 SDKs parse ListBuckets as <Buckets><Bucket><Name>…</Name></Bucket></Buckets>;
+    // without the <Bucket> wrapper they see zero buckets.
+    assert!(xml.contains("<Buckets><Bucket>"), "missing <Bucket> wrapper: {xml}");
+    assert!(xml.contains("<Name>test-bucket</Name>"), "missing bucket name: {xml}");
+    assert!(xml.contains("</Bucket></Buckets>"), "missing closing wrappers: {xml}");
+}
