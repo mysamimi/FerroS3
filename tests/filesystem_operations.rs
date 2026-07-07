@@ -321,6 +321,56 @@ async fn copy_object_and_acl_probe_are_s3_compatible() {
 }
 
 #[tokio::test]
+async fn put_object_returns_matching_etag_and_leaves_no_temp_files() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("atomic.txt");
+    fs::write(&source_file, b"atomic upload").await.unwrap();
+
+    let response = server
+        .client
+        .put(server.object_url("atomic/object.txt"))
+        .header("Authorization", &server.auth_header)
+        .body(fs::read(&source_file).await.unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // PutObject must return an ETag, and it must match a subsequent HEAD.
+    let put_etag = response
+        .headers()
+        .get("etag")
+        .expect("PutObject response is missing the ETag header")
+        .to_str()
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
+    assert_eq!(put_etag, server.head_etag("atomic/object.txt").await);
+
+    // The atomic temp-file + rename must not leave any temporary files behind.
+    let mut names = Vec::new();
+    let mut dir = fs::read_dir(server._storage_dir.path().join("atomic"))
+        .await
+        .unwrap();
+    while let Some(entry) = dir.next_entry().await.unwrap() {
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    assert_eq!(names, vec!["object.txt".to_string()]);
+}
+
+#[tokio::test]
+async fn put_object_overwrite_fully_replaces_content() {
+    let server = TestServer::start().await;
+    let big = server._source_dir.path().join("big.txt");
+    let small = server._source_dir.path().join("small.txt");
+    fs::write(&big, vec![b'A'; 4096]).await.unwrap();
+    fs::write(&small, b"tiny").await.unwrap();
+
+    server.write("ov/object.txt", &big).await;
+    assert_eq!(server.read("ov/object.txt").await.len(), 4096);
+
+    server.write("ov/object.txt", &small).await;
+    assert_eq!(server.read("ov/object.txt").await, b"tiny");
 async fn put_object_acl_does_not_truncate_the_object() {
     let server = TestServer::start().await;
     let source_file = server._source_dir.path().join("acl.txt");

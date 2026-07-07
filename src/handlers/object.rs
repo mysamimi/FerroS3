@@ -240,7 +240,12 @@ pub async fn put_object(
         }
     }
 
-    let mut file = match File::create(&path).await {
+    // Write to a temporary file in the destination directory, then atomically rename
+    // it over the target. The live object stays intact until the upload fully
+    // succeeds, so an aborted or failed PUT never truncates or partially overwrites
+    // existing data, and concurrent PUTs to the same key can't interleave.
+    let temp_path = temp_path_for(&path);
+    let mut file = match File::create(&temp_path).await {
         Ok(f) => f,
         Err(_) => return S3ErrorType::InternalError.to_response(None),
     };
@@ -249,18 +254,68 @@ pub async fn put_object(
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(data) => {
-                if let Err(_) = file.write_all(&data).await {
+                if file.write_all(&data).await.is_err() {
+                    let _ = fs::remove_file(&temp_path).await;
                     return S3ErrorType::InternalError.to_response(None);
                 }
             }
-            Err(_) => return S3ErrorType::InternalError.to_response(None),
+            Err(_) => {
+                let _ = fs::remove_file(&temp_path).await;
+                return S3ErrorType::InternalError.to_response(None);
+            }
         }
     }
 
-    // Invalidate cache
+    // Flush and fsync before we claim success: a write error surfacing only on close
+    // (ENOSPC/EIO) must fail the request, not be swallowed when the file is dropped.
+    if file.flush().await.is_err() || file.sync_all().await.is_err() {
+        let _ = fs::remove_file(&temp_path).await;
+        return S3ErrorType::InternalError.to_response(None);
+    }
+    drop(file);
+
+    if fs::rename(&temp_path, &path).await.is_err() {
+        let _ = fs::remove_file(&temp_path).await;
+        return S3ErrorType::InternalError.to_response(None);
+    }
+
+    // Invalidate the stat cache only after the new object is in place.
     state.cache.remove(&format!("{}/{}", bucket, key));
 
-    StatusCode::OK.into_response()
+    // Return the ETag the S3 PutObject API is expected to provide.
+    let etag = match fs::metadata(&path).await {
+        Ok(metadata) => {
+            let mod_time: DateTime<Utc> = metadata.modified().unwrap_or(SystemTime::now()).into();
+            format!(
+                "\"{:x}-{:x}\"",
+                mod_time.timestamp_nanos_opt().unwrap_or(0),
+                metadata.len()
+            )
+        }
+        Err(_) => return S3ErrorType::InternalError.to_response(None),
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::ETAG, etag)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Build a unique temporary path in the same directory as `path`, so a subsequent
+/// rename onto `path` is atomic (same filesystem). Hidden (dot-prefixed) and suffixed
+/// with pid + a monotonic counter to avoid collisions between concurrent uploads.
+fn temp_path_for(path: &std::path::Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("object");
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{}.{}.{}.tmp", name, std::process::id(), n))
 }
 
 async fn copy_object(
