@@ -51,7 +51,8 @@ impl TestServer {
             _source_dir: source_dir,
             bucket,
             base_url: format!("http://{}", address),
-            auth_header: "test_key".to_string(),
+            // Basic base64("test_key:test_secret")
+            auth_header: "Basic dGVzdF9rZXk6dGVzdF9zZWNyZXQ=".to_string(),
             client: Client::new(),
             handle,
         }
@@ -353,4 +354,190 @@ async fn bucket_routes_work_without_trailing_slash() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+async fn presigned_url_is_rejected_after_it_expires() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("exp.txt");
+    fs::write(&source_file, b"expiring").await.unwrap();
+    server.write("exp/object.txt", &source_file).await;
+
+    // Presign a GET with a 1-second lifetime.
+    let presign = server
+        .client
+        .post(format!("{}/_admin/presign", server.base_url))
+        .header("Authorization", &server.auth_header)
+        .query(&[
+            ("bucket", server.bucket.as_str()),
+            ("key", "exp/object.txt"),
+            ("method", "GET"),
+            ("expires", "1"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(presign.status(), StatusCode::OK);
+    let url = presign.text().await.unwrap();
+
+    // Once the lifetime lapses, the (still perfectly-signed) URL must be rejected.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let expired = server.client.get(&url).send().await.unwrap();
+    assert_eq!(expired.status(), StatusCode::FORBIDDEN);
+async fn put_object_returns_matching_etag_and_leaves_no_temp_files() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("atomic.txt");
+    fs::write(&source_file, b"atomic upload").await.unwrap();
+
+    let response = server
+        .client
+        .put(server.object_url("atomic/object.txt"))
+        .header("Authorization", &server.auth_header)
+        .body(fs::read(&source_file).await.unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // PutObject must return an ETag, and it must match a subsequent HEAD.
+    let put_etag = response
+        .headers()
+        .get("etag")
+        .expect("PutObject response is missing the ETag header")
+        .to_str()
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
+    assert_eq!(put_etag, server.head_etag("atomic/object.txt").await);
+
+    // The atomic temp-file + rename must not leave any temporary files behind.
+    let mut names = Vec::new();
+    let mut dir = fs::read_dir(server._storage_dir.path().join("atomic"))
+        .await
+        .unwrap();
+    while let Some(entry) = dir.next_entry().await.unwrap() {
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    assert_eq!(names, vec!["object.txt".to_string()]);
+}
+
+#[tokio::test]
+async fn put_object_overwrite_fully_replaces_content() {
+    let server = TestServer::start().await;
+    let big = server._source_dir.path().join("big.txt");
+    let small = server._source_dir.path().join("small.txt");
+    fs::write(&big, vec![b'A'; 4096]).await.unwrap();
+    fs::write(&small, b"tiny").await.unwrap();
+
+    server.write("ov/object.txt", &big).await;
+    assert_eq!(server.read("ov/object.txt").await.len(), 4096);
+
+    server.write("ov/object.txt", &small).await;
+    assert_eq!(server.read("ov/object.txt").await, b"tiny");
+async fn put_object_acl_does_not_truncate_the_object() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("acl.txt");
+    fs::write(&source_file, b"acl must not clobber this").await.unwrap();
+    server.write("acl/object.txt", &source_file).await;
+
+    // A PutObjectAcl request (PUT key?acl) must be a no-op on the object body, not
+    // overwrite it with the ACL payload.
+    let response = server
+        .client
+        .put(format!("{}?acl", server.object_url("acl/object.txt")))
+        .header("Authorization", &server.auth_header)
+        .body("<AccessControlPolicy><Owner></Owner></AccessControlPolicy>")
+async fn copy_object_onto_itself_is_rejected_and_preserves_content() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("self.txt");
+    fs::write(&source_file, b"do not lose me").await.unwrap();
+    server.write("self/object.txt", &source_file).await;
+
+    // Copying an object onto itself must be rejected with 400, not silently truncate
+    // the object to 0 bytes (which is what a bare fs::copy would do).
+    let response = server
+        .client
+        .put(server.object_url("self/object.txt"))
+        .header("Authorization", &server.auth_header)
+        .header(
+            "x-amz-copy-source",
+            format!("/{}/{}", server.bucket, "self/object.txt"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // The object must still hold its original bytes.
+    assert_eq!(server.read("self/object.txt").await, b"do not lose me");
+}
+
+#[tokio::test]
+async fn copy_object_result_etag_matches_destination_head() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("etag.txt");
+    fs::write(&source_file, b"etag consistency").await.unwrap();
+    server.write("etag/source.txt", &source_file).await;
+
+    let response = server
+        .client
+        .put(server.object_url("etag/dest.txt"))
+        .header("Authorization", &server.auth_header)
+        .header(
+            "x-amz-copy-source",
+            format!("/{}/{}", server.bucket, "etag/source.txt"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The object body is unchanged.
+    assert_eq!(server.read("acl/object.txt").await, b"acl must not clobber this");
+    let body = response.text().await.unwrap();
+    let start = body.find("<ETag>").unwrap() + "<ETag>".len();
+    let end = body[start..].find("</ETag>").unwrap() + start;
+    let result_etag = body[start..end].trim_matches('"').to_string();
+
+    // The ETag returned by CopyObject must match a subsequent HEAD of the new object.
+    assert_eq!(result_etag, server.head_etag("etag/dest.txt").await);
+}
+
+#[tokio::test]
+async fn bare_access_key_is_rejected_but_valid_basic_auth_passes() {
+    let server = TestServer::start().await;
+    let url = server.object_url("secured/object.txt");
+
+    // A bare access key (no secret) must NOT authenticate. The access key is public
+    // (it appears in every SigV4 Credential), so accepting it alone is a full bypass.
+    let bare_key = server
+        .client
+        .get(&url)
+        .header("Authorization", "test_key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare_key.status(), StatusCode::FORBIDDEN);
+
+    // The correct access key with a wrong secret must also be rejected.
+    let wrong_secret = server
+        .client
+        .get(&url)
+        .basic_auth("test_key", Some("not_the_secret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_secret.status(), StatusCode::FORBIDDEN);
+
+    // No credentials at all must be rejected.
+    let anonymous = server.client.get(&url).send().await.unwrap();
+    assert_eq!(anonymous.status(), StatusCode::FORBIDDEN);
+
+    // Valid Basic auth (access_key:secret_key) still works: 404 (not 403) proves it
+    // passed the auth layer and reached the handler for a missing object.
+    let valid = server
+        .client
+        .get(&url)
+        .basic_auth("test_key", Some("test_secret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), StatusCode::NOT_FOUND);
 }

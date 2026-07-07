@@ -85,7 +85,10 @@ pub async fn get_object(
         None => return S3ErrorType::NoSuchBucket.to_response(Some(bucket)),
     };
 
-    let path = storage.join(key.trim_start_matches('/'));
+    let path = match safe_join(storage, &key) {
+        Some(p) => p,
+        None => return S3ErrorType::AccessDenied.to_response(Some(key)),
+    };
     let mut file = match File::open(&path).await {
         Ok(f) => f,
         Err(_) => return S3ErrorType::NoSuchKey.to_response(Some(key)),
@@ -106,21 +109,31 @@ pub async fn get_object(
 
     // Handle Range Header
     if let Some(range_header) = headers.get(header::RANGE).and_then(|h| h.to_str().ok()) {
-        if let Some(range) = parse_range(range_header, size) {
-            let (start, end) = range;
-            let range_size = end - start + 1;
-            
-            if file.seek(io::SeekFrom::Start(start)).await.is_ok() {
-                let stream = ReaderStream::new(file.take(range_size));
+        match parse_range(range_header, size) {
+            RangeRequest::Satisfiable(start, end) => {
+                let range_size = end - start + 1;
+                if file.seek(io::SeekFrom::Start(start)).await.is_ok() {
+                    let stream = ReaderStream::new(file.take(range_size));
+                    return Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CONTENT_LENGTH, range_size)
+                        .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, size))
+                        .header(header::ETAG, etag)
+                        .header("Last-Modified", mod_time.to_rfc2822())
+                        .body(Body::from_stream(stream))
+                        .unwrap();
+                }
+            }
+            RangeRequest::Unsatisfiable => {
                 return Response::builder()
-                    .status(StatusCode::PARTIAL_CONTENT)
-                    .header(header::CONTENT_TYPE, "application/octet-stream")
-                    .header(header::CONTENT_LENGTH, range_size)
-                    .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, size))
-                    .header(header::ETAG, etag)
-                    .header("Last-Modified", mod_time.to_rfc2822())
-                    .body(Body::from_stream(stream))
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+                    .body(Body::empty())
                     .unwrap();
+            }
+            RangeRequest::Invalid => {
+                // Fallthrough to standard 200 OK
             }
         }
     }
@@ -161,7 +174,10 @@ pub async fn head_object(
         None => return S3ErrorType::NoSuchBucket.to_response(Some(bucket)),
     };
 
-    let path = storage.join(key.trim_start_matches('/'));
+    let path = match safe_join(storage, &key) {
+        Some(p) => p,
+        None => return S3ErrorType::AccessDenied.to_response(Some(key)),
+    };
     let metadata = match fs::metadata(&path).await {
         Ok(m) => m,
         Err(_) => return S3ErrorType::NoSuchKey.to_response(Some(key)),
@@ -191,6 +207,7 @@ pub async fn head_object(
 
 pub async fn put_object(
     Path((bucket, key)): Path<(String, String)>,
+    uri: OriginalUri,
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Body,
@@ -205,7 +222,19 @@ pub async fn put_object(
         None => return S3ErrorType::NoSuchBucket.to_response(Some(bucket)),
     };
 
+    // A PUT carrying the `?acl` subresource is PutObjectAcl — an ACL write, not an
+    // object write. We don't persist ACLs, but we must not fall through to the
+    // object-write path below, which would `File::create` (truncate) the object and
+    // overwrite its body with the ACL payload. Acknowledge it as a no-op.
+    if has_acl_query(uri.0.query()) {
+        return StatusCode::OK.into_response();
+    }
+
     let path = storage.join(key.trim_start_matches('/'));
+    let path = match safe_join(storage, &key) {
+        Some(p) => p,
+        None => return S3ErrorType::AccessDenied.to_response(Some(key)),
+    };
 
     if let Some(copy_source) = headers
         .get("x-amz-copy-source")
@@ -221,7 +250,12 @@ pub async fn put_object(
         }
     }
 
-    let mut file = match File::create(&path).await {
+    // Write to a temporary file in the destination directory, then atomically rename
+    // it over the target. The live object stays intact until the upload fully
+    // succeeds, so an aborted or failed PUT never truncates or partially overwrites
+    // existing data, and concurrent PUTs to the same key can't interleave.
+    let temp_path = temp_path_for(&path);
+    let mut file = match File::create(&temp_path).await {
         Ok(f) => f,
         Err(_) => return S3ErrorType::InternalError.to_response(None),
     };
@@ -230,18 +264,68 @@ pub async fn put_object(
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(data) => {
-                if let Err(_) = file.write_all(&data).await {
+                if file.write_all(&data).await.is_err() {
+                    let _ = fs::remove_file(&temp_path).await;
                     return S3ErrorType::InternalError.to_response(None);
                 }
             }
-            Err(_) => return S3ErrorType::InternalError.to_response(None),
+            Err(_) => {
+                let _ = fs::remove_file(&temp_path).await;
+                return S3ErrorType::InternalError.to_response(None);
+            }
         }
     }
 
-    // Invalidate cache
+    // Flush and fsync before we claim success: a write error surfacing only on close
+    // (ENOSPC/EIO) must fail the request, not be swallowed when the file is dropped.
+    if file.flush().await.is_err() || file.sync_all().await.is_err() {
+        let _ = fs::remove_file(&temp_path).await;
+        return S3ErrorType::InternalError.to_response(None);
+    }
+    drop(file);
+
+    if fs::rename(&temp_path, &path).await.is_err() {
+        let _ = fs::remove_file(&temp_path).await;
+        return S3ErrorType::InternalError.to_response(None);
+    }
+
+    // Invalidate the stat cache only after the new object is in place.
     state.cache.remove(&format!("{}/{}", bucket, key));
 
-    StatusCode::OK.into_response()
+    // Return the ETag the S3 PutObject API is expected to provide.
+    let etag = match fs::metadata(&path).await {
+        Ok(metadata) => {
+            let mod_time: DateTime<Utc> = metadata.modified().unwrap_or(SystemTime::now()).into();
+            format!(
+                "\"{:x}-{:x}\"",
+                mod_time.timestamp_nanos_opt().unwrap_or(0),
+                metadata.len()
+            )
+        }
+        Err(_) => return S3ErrorType::InternalError.to_response(None),
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::ETAG, etag)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Build a unique temporary path in the same directory as `path`, so a subsequent
+/// rename onto `path` is atomic (same filesystem). Hidden (dot-prefixed) and suffixed
+/// with pid + a monotonic counter to avoid collisions between concurrent uploads.
+fn temp_path_for(path: &std::path::Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("object");
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{}.{}.{}.tmp", name, std::process::id(), n))
 }
 
 async fn copy_object(
@@ -261,12 +345,28 @@ async fn copy_object(
         None => return S3ErrorType::NoSuchBucket.to_response(Some(source_bucket)),
     };
 
-    let source_path = source_storage.join(source_key.trim_start_matches('/'));
-    let source_metadata = match fs::metadata(&source_path).await {
-        Ok(metadata) if !metadata.is_dir() => metadata,
+    let source_path = match safe_join(source_storage, &source_key) {
+        Some(p) => p,
+        None => return S3ErrorType::AccessDenied.to_response(Some(source_key)),
+    };
+    match fs::metadata(&source_path).await {
+        Ok(metadata) if !metadata.is_dir() => {}
         Ok(_) => return S3ErrorType::NoSuchKey.to_response(Some(source_key)),
         Err(_) => return S3ErrorType::NoSuchKey.to_response(Some(source_key)),
     };
+
+    // Reject a copy of an object onto itself. `fs::copy` opens the destination with
+    // O_TRUNC before reading the source, so when both paths resolve to the same inode
+    // the object is truncated to 0 bytes. S3 rejects self-copies (unless metadata is
+    // being changed, which we don't support) rather than performing them.
+    if let (Ok(src_canon), Ok(dst_canon)) = (
+        fs::canonicalize(&source_path).await,
+        fs::canonicalize(destination_path).await,
+    ) {
+        if src_canon == dst_canon {
+            return S3ErrorType::InvalidRequest.to_response(Some(destination_key.to_string()));
+        }
+    }
 
     if let Some(parent) = destination_path.parent() {
         if let Err(_) = fs::create_dir_all(parent).await {
@@ -282,14 +382,21 @@ async fn copy_object(
         .cache
         .remove(&format!("{}/{}", destination_bucket, destination_key));
 
-    let mod_time: DateTime<Utc> = source_metadata
+    // Build the result from the destination's own metadata so the returned ETag/
+    // LastModified match a subsequent HEAD/GET of the copied object (the source's
+    // pre-copy mtime would not).
+    let dest_metadata = match fs::metadata(destination_path).await {
+        Ok(metadata) => metadata,
+        Err(_) => return S3ErrorType::InternalError.to_response(None),
+    };
+    let mod_time: DateTime<Utc> = dest_metadata
         .modified()
         .unwrap_or(SystemTime::now())
         .into();
     let etag = format!(
         "\"{:x}-{:x}\"",
         mod_time.timestamp_nanos_opt().unwrap_or(0),
-        source_metadata.len()
+        dest_metadata.len()
     );
     let result = CopyObjectResult {
         last_modified: mod_time.to_rfc3339(),
@@ -318,7 +425,10 @@ pub async fn delete_object(
         None => return S3ErrorType::NoSuchBucket.to_response(Some(bucket)),
     };
 
-    let path = storage.join(key.trim_start_matches('/'));
+    let path = match safe_join(storage, &key) {
+        Some(p) => p,
+        None => return S3ErrorType::AccessDenied.to_response(Some(key)),
+    };
     if let Err(_) = fs::remove_file(&path).await {
         // S3 returns 204 even if file doesn't exist during DELETE
         return StatusCode::NO_CONTENT.into_response();
@@ -328,23 +438,92 @@ pub async fn delete_object(
     StatusCode::NO_CONTENT.into_response()
 }
 
-fn parse_range(range_header: &str, file_size: u64) -> Option<(u64, u64)> {
-    if !range_header.starts_with("bytes=") { return None; }
+enum RangeRequest {
+    Satisfiable(u64, u64),
+    Unsatisfiable,
+    Invalid,
+}
+
+fn parse_range(range_header: &str, file_size: u64) -> RangeRequest {
+    if !range_header.starts_with("bytes=") { return RangeRequest::Invalid; }
     let range_str = &range_header[6..];
     let parts: Vec<&str> = range_str.split('-').collect();
-    if parts.len() != 2 { return None; }
+    if parts.len() != 2 { return RangeRequest::Invalid; }
 
-    let start = parts[0].parse::<u64>().ok()?;
-    let end = if parts[1].is_empty() {
-        file_size - 1
-    } else {
-        parts[1].parse::<u64>().ok()?
+    let start_str = parts[0].trim();
+    let end_str = parts[1].trim();
+
+    if start_str.is_empty() && end_str.is_empty() {
+        return RangeRequest::Invalid;
+    }
+
+    if start_str.is_empty() {
+        // Suffix range
+        let Ok(suffix_len) = end_str.parse::<u64>() else {
+            return RangeRequest::Invalid;
+        };
+        if suffix_len == 0 {
+            return RangeRequest::Invalid;
+        }
+        if file_size == 0 {
+            return RangeRequest::Unsatisfiable;
+        }
+        let start = file_size.saturating_sub(suffix_len);
+        let end = file_size - 1;
+        return RangeRequest::Satisfiable(start, end);
+    }
+
+    let Ok(start) = start_str.parse::<u64>() else {
+        return RangeRequest::Invalid;
     };
 
-    if start <= end && end < file_size {
-        Some((start, end))
+    if start >= file_size {
+        return RangeRequest::Unsatisfiable;
+    }
+
+    let end = if end_str.is_empty() {
+        file_size.saturating_sub(1)
     } else {
-        None
+        let Ok(parsed_end) = end_str.parse::<u64>() else {
+            return RangeRequest::Invalid;
+        };
+        std::cmp::min(parsed_end, file_size.saturating_sub(1))
+    };
+
+    if start <= end {
+        RangeRequest::Satisfiable(start, end)
+    } else {
+        RangeRequest::Invalid
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_range() {
+        // Normal ranges
+        assert!(matches!(parse_range("bytes=0-499", 1000), RangeRequest::Satisfiable(0, 499)));
+        assert!(matches!(parse_range("bytes=500-", 1000), RangeRequest::Satisfiable(500, 999)));
+        
+        // Suffix ranges
+        assert!(matches!(parse_range("bytes=-500", 1000), RangeRequest::Satisfiable(500, 999)));
+        assert!(matches!(parse_range("bytes=-1500", 1000), RangeRequest::Satisfiable(0, 999)));
+
+        // Unsatisfiable
+        assert!(matches!(parse_range("bytes=1000-", 1000), RangeRequest::Unsatisfiable));
+        assert!(matches!(parse_range("bytes=9999-", 1000), RangeRequest::Unsatisfiable));
+        
+        // Zero length files
+        assert!(matches!(parse_range("bytes=-500", 0), RangeRequest::Unsatisfiable));
+        assert!(matches!(parse_range("bytes=0-", 0), RangeRequest::Unsatisfiable));
+
+        // Invalid ranges
+        assert!(matches!(parse_range("bytes=abc-def", 1000), RangeRequest::Invalid));
+        assert!(matches!(parse_range("bytes=-", 1000), RangeRequest::Invalid));
+        assert!(matches!(parse_range("bytes=500-499", 1000), RangeRequest::Invalid));
+        assert!(matches!(parse_range("wrong=0-100", 1000), RangeRequest::Invalid));
     }
 }
 
@@ -390,4 +569,53 @@ fn parse_copy_source(copy_source: &str) -> Option<(String, String)> {
 
 fn owner_id() -> String {
     "75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a".to_string()
+}
+
+fn safe_join(storage: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let mut resolved = storage.to_path_buf();
+    for component in std::path::Path::new(key).components() {
+        match component {
+            Component::Normal(c) => resolved.push(c),
+            Component::RootDir | Component::CurDir => continue,
+            Component::Prefix(_) | Component::ParentDir => return None,
+        }
+    }
+    Some(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_safe_join() {
+        let storage = Path::new("/var/data");
+
+        // Normal keys
+        assert_eq!(safe_join(storage, "my_file.txt").unwrap(), Path::new("/var/data/my_file.txt"));
+        assert_eq!(safe_join(storage, "folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // Leading slashes are ignored (RootDir)
+        assert_eq!(safe_join(storage, "/folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // Current dir dots are ignored
+        assert_eq!(safe_join(storage, "./folder/./file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // ParentDir traversal is rejected
+        assert!(safe_join(storage, "../etc/passwd").is_none());
+        assert!(safe_join(storage, "folder/../../etc/passwd").is_none());
+
+        // Windows drive prefixes are only parsed as `Prefix` components on Windows,
+        // where they are rejected. On Unix a string like "C:/..." is just a normal
+        // (contained) key, so it resolves safely inside storage instead.
+        #[cfg(windows)]
+        assert!(safe_join(storage, "C:/Windows/System32").is_none());
+        #[cfg(not(windows))]
+        assert_eq!(
+            safe_join(storage, "C:/Windows/System32").unwrap(),
+            Path::new("/var/data/C:/Windows/System32")
+        );
+    }
 }

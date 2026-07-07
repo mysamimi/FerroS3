@@ -23,6 +23,7 @@ pub enum S3ErrorType {
     NoSuchKey,
     NoSuchBucket,
     AccessDenied,
+    InvalidRequest,
     InternalError,
     // Add more as needed
 }
@@ -67,6 +68,11 @@ impl S3ErrorType {
                 StatusCode::FORBIDDEN,
                 "AccessDenied",
                 "Access Denied.",
+            ),
+            S3ErrorType::InvalidRequest => (
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",
             ),
             S3ErrorType::InternalError => (
                 StatusCode::INTERNAL_SERVER_ERROR,

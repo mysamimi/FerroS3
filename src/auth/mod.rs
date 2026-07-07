@@ -19,7 +19,9 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     if state.config.verbose {
-        println!("--> {} {}", req.method(), req.uri());
+        // Log the path only — the query string carries X-Amz-Signature / X-Amz-Credential,
+        // which must not be written to logs.
+        println!("--> {} {}", req.method(), req.uri().path());
     }
 
     let auth_header = req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()).map(|s| s.to_string());
@@ -36,13 +38,6 @@ pub async fn auth_middleware(
                 if auth_cfg.access_key == access_key && auth_cfg.secret_key == secret_key {
                     return next.run(req).await;
                 }
-            }
-        }
-        
-        // Fallback for simple access key matching (useful for tests and simple scripts)
-        if let Some(auth_cfg) = &state.config.auth {
-            if auth == auth_cfg.access_key {
-                return next.run(req).await;
             }
         }
     }
@@ -153,6 +148,25 @@ async fn verify_query_auth(
         Some(h) => h,
         None => return S3ErrorType::AccessDenied.to_response(None),
     };
+
+    // Enforce presigned-URL expiry. A presigned URL is a bearer credential valid only
+    // for X-Amz-Expires seconds after X-Amz-Date; without this check it never expires.
+    let expires: i64 = match query.get("X-Amz-Expires").and_then(|e| e.parse().ok()) {
+        Some(e) if e > 0 && e <= 604_800 => e, // AWS caps presign lifetime at 7 days
+        _ => return S3ErrorType::AccessDenied.to_response(None),
+    };
+    match chrono::NaiveDateTime::parse_from_str(x_amz_date, "%Y%m%dT%H%M%SZ") {
+        Ok(signed_at) => {
+            let age = chrono::Utc::now()
+                .signed_duration_since(signed_at.and_utc())
+                .num_seconds();
+            // Reject expired URLs, and URLs dated too far in the future (allow small skew).
+            if age > expires || age < -300 {
+                return S3ErrorType::AccessDenied.to_response(None);
+            }
+        }
+        Err(_) => return S3ErrorType::AccessDenied.to_response(None),
+    }
 
     let auth_cfg = match &state.config.auth {
         Some(a) => a,
