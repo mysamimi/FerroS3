@@ -321,6 +321,19 @@ async fn copy_object_and_acl_probe_are_s3_compatible() {
 }
 
 #[tokio::test]
+async fn put_object_acl_does_not_truncate_the_object() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("acl.txt");
+    fs::write(&source_file, b"acl must not clobber this").await.unwrap();
+    server.write("acl/object.txt", &source_file).await;
+
+    // A PutObjectAcl request (PUT key?acl) must be a no-op on the object body, not
+    // overwrite it with the ACL payload.
+    let response = server
+        .client
+        .put(format!("{}?acl", server.object_url("acl/object.txt")))
+        .header("Authorization", &server.auth_header)
+        .body("<AccessControlPolicy><Owner></Owner></AccessControlPolicy>")
 async fn copy_object_onto_itself_is_rejected_and_preserves_content() {
     let server = TestServer::start().await;
     let source_file = server._source_dir.path().join("self.txt");
@@ -366,6 +379,8 @@ async fn copy_object_result_etag_matches_destination_head() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
+    // The object body is unchanged.
+    assert_eq!(server.read("acl/object.txt").await, b"acl must not clobber this");
     let body = response.text().await.unwrap();
     let start = body.find("<ETag>").unwrap() + "<ETag>".len();
     let end = body[start..].find("</ETag>").unwrap() + start;
