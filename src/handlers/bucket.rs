@@ -18,7 +18,16 @@ pub struct ListAllMyBucketsResult {
     #[serde(rename = "Owner")]
     pub owner: Owner,
     #[serde(rename = "Buckets")]
-    pub buckets: Vec<Bucket>,
+    pub buckets: Buckets,
+}
+
+/// Container so the XML nests as `<Buckets><Bucket>…</Bucket></Buckets>`, which is
+/// what S3 clients parse. Without the wrapper each entry serialized as a bare
+/// repeated `<Buckets>` element and SDKs saw zero buckets.
+#[derive(Serialize, ToSchema)]
+pub struct Buckets {
+    #[serde(rename = "Bucket")]
+    pub bucket: Vec<Bucket>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -54,7 +63,7 @@ pub async fn list_buckets(
             id: "75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a".to_string(),
             display_name: "Owner".to_string(),
         },
-        buckets,
+        buckets: Buckets { bucket: buckets },
     };
 
     let xml = quick_xml::se::to_string(&result).unwrap();
