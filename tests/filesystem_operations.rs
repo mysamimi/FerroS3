@@ -374,3 +374,45 @@ async fn copy_object_result_etag_matches_destination_head() {
     // The ETag returned by CopyObject must match a subsequent HEAD of the new object.
     assert_eq!(result_etag, server.head_etag("etag/dest.txt").await);
 }
+
+#[tokio::test]
+async fn bare_access_key_is_rejected_but_valid_basic_auth_passes() {
+    let server = TestServer::start().await;
+    let url = server.object_url("secured/object.txt");
+
+    // A bare access key (no secret) must NOT authenticate. The access key is public
+    // (it appears in every SigV4 Credential), so accepting it alone is a full bypass.
+    let bare_key = server
+        .client
+        .get(&url)
+        .header("Authorization", "test_key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare_key.status(), StatusCode::FORBIDDEN);
+
+    // The correct access key with a wrong secret must also be rejected.
+    let wrong_secret = server
+        .client
+        .get(&url)
+        .basic_auth("test_key", Some("not_the_secret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_secret.status(), StatusCode::FORBIDDEN);
+
+    // No credentials at all must be rejected.
+    let anonymous = server.client.get(&url).send().await.unwrap();
+    assert_eq!(anonymous.status(), StatusCode::FORBIDDEN);
+
+    // Valid Basic auth (access_key:secret_key) still works: 404 (not 403) proves it
+    // passed the auth layer and reached the handler for a missing object.
+    let valid = server
+        .client
+        .get(&url)
+        .basic_auth("test_key", Some("test_secret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), StatusCode::NOT_FOUND);
+}

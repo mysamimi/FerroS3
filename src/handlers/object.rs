@@ -270,18 +270,12 @@ async fn copy_object(
         None => return S3ErrorType::NoSuchBucket.to_response(Some(source_bucket)),
     };
 
-<<<<<<< fix-copy-object-self-truncation
-    let source_path = source_storage.join(source_key.trim_start_matches('/'));
-    match fs::metadata(&source_path).await {
-        Ok(metadata) if !metadata.is_dir() => {}
-=======
     let source_path = match safe_join(source_storage, &source_key) {
         Some(p) => p,
         None => return S3ErrorType::AccessDenied.to_response(Some(source_key)),
     };
-    let source_metadata = match fs::metadata(&source_path).await {
-        Ok(metadata) if !metadata.is_dir() => metadata,
->>>>>>> main
+    match fs::metadata(&source_path).await {
+        Ok(metadata) if !metadata.is_dir() => {}
         Ok(_) => return S3ErrorType::NoSuchKey.to_response(Some(source_key)),
         Err(_) => return S3ErrorType::NoSuchKey.to_response(Some(source_key)),
     };
