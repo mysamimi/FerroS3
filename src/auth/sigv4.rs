@@ -18,6 +18,13 @@ pub struct SigV4Params<'a> {
 }
 
 pub fn verify_signature(params: SigV4Params, signature: &str) -> bool {
+    // `date` is attacker-controlled (x-amz-date). Reject anything that isn't at least a
+    // full `YYYYMMDD` prefix before slicing `[..8]`, which would otherwise panic on a
+    // short or multi-byte value.
+    if params.date.len() < 8 || !params.date.is_char_boundary(8) {
+        return false;
+    }
+
     let canonical_request = create_canonical_request(&params);
     let string_to_sign = create_string_to_sign(&params, &canonical_request);
     let signing_key = create_signing_key(params.secret_key, &params.date[..8], params.region, params.service);
@@ -27,7 +34,21 @@ pub fn verify_signature(params: SigV4Params, signature: &str) -> bool {
     let result = mac.finalize().into_bytes();
     let calculated_signature = hex::encode(result);
 
-    calculated_signature == signature
+    constant_time_eq(calculated_signature.as_bytes(), signature.as_bytes())
+}
+
+/// Constant-time byte comparison, so verification time doesn't reveal how many leading
+/// bytes of a guessed signature were correct (a timing side channel). Length is not
+/// secret here — a hex SHA-256 signature is always 64 chars.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
 }
 
 fn create_canonical_request(params: &SigV4Params) -> String {

@@ -10,7 +10,7 @@ use base64::Engine;
 use std::sync::Arc;
 use std::collections::BTreeMap;
 use crate::state::AppState;
-use crate::auth::sigv4::{verify_signature, SigV4Params};
+use crate::auth::sigv4::{constant_time_eq, verify_signature, SigV4Params};
 use crate::error::S3ErrorType;
 
 pub async fn auth_middleware(
@@ -35,7 +35,11 @@ pub async fn auth_middleware(
 
         if let Some((access_key, secret_key)) = parse_basic_auth(&auth) {
             if let Some(auth_cfg) = &state.config.auth {
-                if auth_cfg.access_key == access_key && auth_cfg.secret_key == secret_key {
+                // Compare the secret in constant time to avoid a timing side channel;
+                // the access key is public, so a plain compare is fine.
+                if auth_cfg.access_key == access_key
+                    && constant_time_eq(auth_cfg.secret_key.as_bytes(), secret_key.as_bytes())
+                {
                     return next.run(req).await;
                 }
             }
@@ -206,10 +210,21 @@ async fn verify_query_auth(
 fn parse_query(query: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for part in query.split('&') {
-        let kv: Vec<&str> = part.split('=').collect();
-        if kv.len() == 2 {
-            map.insert(kv[0].to_string(), urlencoding::decode(kv[1]).unwrap_or_default().to_string());
+        if part.is_empty() {
+            continue;
         }
+        // Split on the FIRST '=' only: a valueless flag (e.g. `acl`) keeps an empty
+        // value, and a value containing '=' (e.g. a base64 token) is preserved. The
+        // previous `split('=')` with a len==2 guard dropped both, which broke SigV4
+        // canonical-query construction for those requests.
+        let (key, value) = match part.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (part, ""),
+        };
+        map.insert(
+            key.to_string(),
+            urlencoding::decode(value).unwrap_or_default().into_owned(),
+        );
     }
     map
 }

@@ -321,6 +321,29 @@ async fn copy_object_and_acl_probe_are_s3_compatible() {
 }
 
 #[tokio::test]
+async fn malformed_sigv4_date_is_rejected_not_panicking() {
+    let server = TestServer::start().await;
+
+    // A SigV4 header whose x-amz-date is shorter than 8 chars previously panicked the
+    // handler via `&date[..8]`. It must now be a clean 403, and the server must survive.
+    let response = server
+        .client
+        .get(server.object_url("any/object.txt"))
+        .header(
+            "Authorization",
+            "AWS4-HMAC-SHA256 Credential=test_key/20240101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host, Signature=deadbeef",
+        )
+        .header("x-amz-date", "abc")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // Server still serving afterwards (would fail if the task had panicked the runtime).
+    let ok = server
+        .client
+        .head(format!("{}/{}/", server.base_url, server.bucket))
 async fn list_buckets_nests_bucket_elements() {
     let server = TestServer::start().await;
     let response = server
@@ -359,7 +382,7 @@ async fn bucket_routes_work_without_trailing_slash() {
         .send()
         .await
         .unwrap();
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(ok.status(), StatusCode::OK);
 async fn presigned_url_is_rejected_after_it_expires() {
     let server = TestServer::start().await;
     let source_file = server._source_dir.path().join("exp.txt");
