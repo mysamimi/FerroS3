@@ -29,6 +29,7 @@ futures-util = "0.3"
 hex = "0.4"
 utoipa = { version = "5", features = ["axum_extras", "chrono"] }
 quick_cache = "0.7.0"
+http-body-util = "0.1"
 
 [profile.release]
 # Cross-crate inlining matters here: hot paths (axum routing, tokio I/O, sha2/hmac
