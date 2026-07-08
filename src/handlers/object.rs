@@ -119,8 +119,9 @@ pub async fn get_object(
                         .header(header::CONTENT_TYPE, "application/octet-stream")
                         .header(header::CONTENT_LENGTH, range_size)
                         .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, size))
+                        .header(header::ACCEPT_RANGES, "bytes")
                         .header(header::ETAG, etag)
-                        .header("Last-Modified", mod_time.to_rfc2822())
+                        .header(header::LAST_MODIFIED, http_date(mod_time))
                         .body(Body::from_stream(stream))
                         .unwrap();
                 }
@@ -144,8 +145,9 @@ pub async fn get_object(
     Response::builder()
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, size)
+        .header(header::ACCEPT_RANGES, "bytes")
         .header(header::ETAG, etag)
-        .header("Last-Modified", mod_time.to_rfc2822())
+        .header(header::LAST_MODIFIED, http_date(mod_time))
         .body(body)
         .unwrap()
 }
@@ -163,8 +165,9 @@ pub async fn head_object(
     if let Some(cached) = state.cache.get(&cache_key) {
         return Response::builder()
             .header(header::CONTENT_LENGTH, cached.size)
+            .header(header::ACCEPT_RANGES, "bytes")
             .header(header::ETAG, &cached.etag)
-            .header("Last-Modified", cached.mod_time.to_rfc2822())
+            .header(header::LAST_MODIFIED, http_date(cached.mod_time))
             .body(Body::empty())
             .unwrap();
     }
@@ -199,8 +202,9 @@ pub async fn head_object(
 
     Response::builder()
         .header(header::CONTENT_LENGTH, size)
+        .header(header::ACCEPT_RANGES, "bytes")
         .header(header::ETAG, etag)
-        .header("Last-Modified", mod_time.to_rfc2822())
+        .header(header::LAST_MODIFIED, http_date(mod_time))
         .body(Body::empty())
         .unwrap()
 }
@@ -555,6 +559,13 @@ mod tests {
             Path::new("/var/data/C:/Windows/System32")
         );
     }
+}
+
+/// Format a UTC timestamp as an HTTP-date (RFC 7231 IMF-fixdate), e.g.
+/// "Sun, 06 Nov 1994 08:49:37 GMT". `DateTime::to_rfc2822` emits a "+0000" offset
+/// instead of "GMT", which is not a valid HTTP-date and is rejected by strict clients.
+fn http_date(dt: DateTime<Utc>) -> String {
+    dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
 fn has_acl_query(query: Option<&str>) -> bool {

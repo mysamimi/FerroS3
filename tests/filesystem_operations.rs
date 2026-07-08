@@ -609,3 +609,48 @@ async fn bare_access_key_is_rejected_but_valid_basic_auth_passes() {
         .unwrap();
     assert_eq!(valid.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn responses_use_http_date_and_advertise_accept_ranges() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("hdr.txt");
+    fs::write(&source_file, b"headers").await.unwrap();
+    server.write("hdr/object.txt", &source_file).await;
+
+    for method in ["GET", "HEAD"] {
+        let request = if method == "GET" {
+            server.client.get(server.object_url("hdr/object.txt"))
+        } else {
+            server.client.head(server.object_url("hdr/object.txt"))
+        };
+        let response = request
+            .header("Authorization", &server.auth_header)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Last-Modified must be an RFC 7231 HTTP-date ("… GMT"), not rfc2822 ("+0000").
+        let last_modified = response
+            .headers()
+            .get("last-modified")
+            .expect("missing Last-Modified")
+            .to_str()
+            .unwrap();
+        assert!(
+            last_modified.ends_with(" GMT"),
+            "{method} Last-Modified is not an HTTP-date: {last_modified}"
+        );
+        assert!(
+            !last_modified.contains("+0000"),
+            "{method} Last-Modified still rfc2822: {last_modified}"
+        );
+
+        // The server supports ranges, so it must advertise Accept-Ranges: bytes.
+        let accept_ranges = response
+            .headers()
+            .get("accept-ranges")
+            .map(|v| v.to_str().unwrap());
+        assert_eq!(accept_ranges, Some("bytes"), "{method} missing Accept-Ranges");
+    }
+}
