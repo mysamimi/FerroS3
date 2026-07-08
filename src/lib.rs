@@ -95,6 +95,7 @@ mod tests {
             endpoint: String::new(),
             verbose: false,
             cache_size: 8,
+            fsync: true,
             auth: None,
             buckets: vec![],
         };

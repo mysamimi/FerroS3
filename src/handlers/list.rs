@@ -310,6 +310,7 @@ mod tests {
             endpoint: "0.0.0.0".to_string(),
             verbose: false,
             cache_size: 10,
+            fsync: true,
             auth: None,
             buckets: vec![BucketConfig { name: bucket_name.to_string(), storage: storage_path.to_string() }],
         };

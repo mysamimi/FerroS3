@@ -31,6 +31,7 @@ impl TestServer {
             endpoint: "127.0.0.1".to_string(),
             verbose: false,
             cache_size: 32,
+            fsync: true,
             auth: Some(AuthConfig {
                 access_key: "test_key".to_string(),
                 secret_key: "test_secret".to_string(),

@@ -283,9 +283,15 @@ pub async fn put_object(
         }
     }
 
-    // Flush and fsync before we claim success: a write error surfacing only on close
-    // (ENOSPC/EIO) must fail the request, not be swallowed when the file is dropped.
-    if file.flush().await.is_err() || file.sync_all().await.is_err() {
+    // Flush before we claim success: a write error surfacing only on close (ENOSPC/EIO)
+    // must fail the request, not be swallowed when the file is dropped. The fsync is
+    // configurable — it dominates small-PUT latency, and deployments where the proxy is
+    // not the source of truth may prefer to skip it.
+    if file.flush().await.is_err() {
+        let _ = fs::remove_file(&temp_path).await;
+        return S3ErrorType::InternalError.to_response(None);
+    }
+    if state.config.fsync && file.sync_all().await.is_err() {
         let _ = fs::remove_file(&temp_path).await;
         return S3ErrorType::InternalError.to_response(None);
     }
