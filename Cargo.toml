@@ -20,7 +20,6 @@ md-5 = "0.10"
 quick-xml = { version = "0.36", features = ["serialize"] }
 bytes = "1.0"
 http = "1.0"
-tower-http = { version = "=0.5.2", features = ["full"] }
 walkdir = "2.3"
 mime_guess = "2.0"
 urlencoding = "2.1"
