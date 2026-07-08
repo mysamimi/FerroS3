@@ -31,6 +31,13 @@ hex = "0.4"
 utoipa = { version = "5", features = ["axum_extras", "chrono"] }
 quick_cache = "0.7.0"
 
+[profile.release]
+# Cross-crate inlining matters here: hot paths (axum routing, tokio I/O, sha2/hmac
+# signing) span many small crates. Thin LTO + one codegen unit lets LLVM optimise
+# across those boundaries; the cost is release build time only.
+lto = "thin"
+codegen-units = 1
+
 [build-dependencies]
 cc = "1.0"
 
