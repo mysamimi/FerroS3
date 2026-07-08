@@ -100,5 +100,52 @@ docker build -t ferros3 .
 docker run -p 8080:8080 -v ./config.yaml:/app/config.yaml -v ./data:/data ferros3
 ```
 
+## 🧪 Testing
+
+Run the test suite (including filesystem integration tests) with:
+
+```bash
+cargo test
+# or
+make test
+```
+
+## 🤝 Contributing
+
+Contributions are welcome! Whether it's a bug fix, a new feature, or improved documentation, we appreciate your help.
+
+### Getting Started
+
+1.  **Fork** the repository and clone your fork.
+2.  Create a feature branch:
+    ```bash
+    git checkout -b feature/my-awesome-feature
+    ```
+3.  Make your changes.
+
+### Before Submitting
+
+Please make sure your changes pass the following checks:
+
+```bash
+cargo fmt --all          # Format the code
+cargo clippy -- -D warnings   # Lint (treat warnings as errors)
+cargo test               # Run the test suite
+```
+
+### Submitting a Pull Request
+
+1.  Commit your changes with a clear, descriptive message.
+2.  Push to your fork and open a Pull Request against the `main` branch.
+3.  Describe **what** you changed and **why**. Link any related issues.
+
+### Reporting Issues
+
+Found a bug or have a feature request? Please [open an issue](https://github.com/mysamimi/ferros3/issues) with:
+
+- A clear description of the problem or request.
+- Steps to reproduce (for bugs).
+- Your platform (Linux / macOS / FreeBSD) and FerroS3 version.
+
 ## 📝 License
 This project is licensed under the MIT License.
