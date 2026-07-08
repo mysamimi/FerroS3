@@ -8,7 +8,7 @@ pub mod openapi;
 pub mod state;
 
 use axum::{middleware, routing::get, Router};
-use dashmap::DashMap;
+use quick_cache::sync::Cache;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::fs;
 
@@ -36,7 +36,9 @@ pub fn build_state(config: &Config) -> Arc<AppState> {
 
     Arc::new(AppState {
         config: config.clone(),
-        cache: DashMap::with_capacity(config.cache_size),
+        // `cache_size` is the cache's max entry count (it was previously only an
+        // initial capacity, so the cache grew without bound).
+        cache: Cache::new(config.cache_size),
         storage_map,
     })
 }
@@ -78,4 +80,38 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     let app = app.merge(build_docs_router());
 
     app
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::CachedStat;
+    use chrono::Utc;
+
+    #[test]
+    fn stat_cache_is_bounded_by_cache_size() {
+        let config = Config {
+            port: 0,
+            endpoint: String::new(),
+            verbose: false,
+            cache_size: 8,
+            auth: None,
+            buckets: vec![],
+        };
+        let state = build_state(&config);
+
+        // Insert far more entries than the bound; eviction must keep the cache at or
+        // under cache_size (the old DashMap grew without limit here).
+        for i in 0..1000 {
+            state.cache.insert(
+                format!("bucket/key-{i}"),
+                CachedStat { size: i, mod_time: Utc::now(), etag: format!("\"{i}\"") },
+            );
+        }
+        assert!(
+            state.cache.len() <= 8,
+            "cache exceeded its bound: {} entries",
+            state.cache.len()
+        );
+    }
 }

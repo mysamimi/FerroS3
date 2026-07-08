@@ -296,7 +296,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::collections::HashMap;
-    use dashmap::DashMap;
+    use quick_cache::sync::Cache;
     use tokio::fs;
     use axum::body::to_bytes;
     use crate::config::{Config, BucketConfig};
@@ -316,7 +316,7 @@ mod tests {
 
         Arc::new(AppState {
             config,
-            cache: DashMap::new(),
+            cache: Cache::new(10),
             storage_map,
         })
     }

@@ -1,6 +1,7 @@
 port: 8080
 endpoint: "0.0.0.0"
 verbose: true
+# Maximum number of entries in the object stat cache (older entries are evicted).
 cache_size: 10000
 auth:
   access_key: "YOUR_ACCESS_KEY"

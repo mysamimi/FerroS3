@@ -295,15 +295,21 @@ pub async fn put_object(
     // Invalidate the stat cache only after the new object is in place.
     state.cache.remove(&format!("{}/{}", bucket, key));
 
-    // Return the ETag the S3 PutObject API is expected to provide.
+    // Return the ETag the S3 PutObject API is expected to provide, and prime the stat
+    // cache with the fresh metadata so the common upload-then-HEAD pattern hits it.
     let etag = match fs::metadata(&path).await {
         Ok(metadata) => {
             let mod_time: DateTime<Utc> = metadata.modified().unwrap_or(SystemTime::now()).into();
-            format!(
+            let etag = format!(
                 "\"{:x}-{:x}\"",
                 mod_time.timestamp_nanos_opt().unwrap_or(0),
                 metadata.len()
-            )
+            );
+            state.cache.insert(
+                format!("{}/{}", bucket, key),
+                CachedStat { size: metadata.len(), mod_time, etag: etag.clone() },
+            );
+            etag
         }
         Err(_) => return S3ErrorType::InternalError.to_response(None),
     };
