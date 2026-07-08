@@ -1,5 +1,11 @@
 # 🦀 FerroS3
 
+[![CI](https://github.com/mysamimi/ferros3/actions/workflows/ci.yml/badge.svg)](https://github.com/mysamimi/ferros3/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![GitHub release](https://img.shields.io/github/v/release/mysamimi/ferros3)](https://github.com/mysamimi/ferros3/releases)
+[![Rust](https://img.shields.io/badge/Rust-2021-orange.svg?logo=rust)](https://www.rust-lang.org)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20FreeBSD-blue)](#-cross-compilation-freebsdlinux)
+
 ![FerroS3 Banner](assets/banner.png)
 
 **FerroS3** is a high-performance, minimalist S3-compatible proxy written in Rust. It serves local filesystem directories as S3 buckets, providing a lightweight alternative to MinIO for resource-constrained environments like old FreeBSD kernels or embedded Linux.

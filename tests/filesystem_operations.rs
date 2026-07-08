@@ -344,12 +344,34 @@ async fn malformed_sigv4_date_is_rejected_not_panicking() {
     let ok = server
         .client
         .head(format!("{}/{}/", server.base_url, server.bucket))
+        .header("Authorization", &server.auth_header)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn list_buckets_nests_bucket_elements() {
     let server = TestServer::start().await;
     let response = server
         .client
         .get(format!("{}/", server.base_url))
         .header("Authorization", &server.auth_header)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let xml = response.text().await.unwrap();
+
+    // S3 SDKs parse ListBuckets as <Buckets><Bucket><Name>…</Name></Bucket></Buckets>;
+    // without the <Bucket> wrapper they see zero buckets.
+    assert!(xml.contains("<Buckets><Bucket>"), "missing <Bucket> wrapper: {xml}");
+    assert!(xml.contains("<Name>test-bucket</Name>"), "missing bucket name: {xml}");
+    assert!(xml.contains("</Bucket></Buckets>"), "missing closing wrappers: {xml}");
+}
+
+#[tokio::test]
 async fn bucket_routes_work_without_trailing_slash() {
     let server = TestServer::start().await;
 
@@ -382,7 +404,10 @@ async fn bucket_routes_work_without_trailing_slash() {
         .send()
         .await
         .unwrap();
-    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn presigned_url_is_rejected_after_it_expires() {
     let server = TestServer::start().await;
     let source_file = server._source_dir.path().join("exp.txt");
@@ -410,6 +435,9 @@ async fn presigned_url_is_rejected_after_it_expires() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let expired = server.client.get(&url).send().await.unwrap();
     assert_eq!(expired.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn put_object_returns_matching_etag_and_leaves_no_temp_files() {
     let server = TestServer::start().await;
     let source_file = server._source_dir.path().join("atomic.txt");
@@ -424,13 +452,6 @@ async fn put_object_returns_matching_etag_and_leaves_no_temp_files() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let xml = response.text().await.unwrap();
-
-    // S3 SDKs parse ListBuckets as <Buckets><Bucket><Name>…</Name></Bucket></Buckets>;
-    // without the <Bucket> wrapper they see zero buckets.
-    assert!(xml.contains("<Buckets><Bucket>"), "missing <Bucket> wrapper: {xml}");
-    assert!(xml.contains("<Name>test-bucket</Name>"), "missing bucket name: {xml}");
-    assert!(xml.contains("</Bucket></Buckets>"), "missing closing wrappers: {xml}");
 
     // PutObject must return an ETag, and it must match a subsequent HEAD.
     let put_etag = response
@@ -467,6 +488,9 @@ async fn put_object_overwrite_fully_replaces_content() {
 
     server.write("ov/object.txt", &small).await;
     assert_eq!(server.read("ov/object.txt").await, b"tiny");
+}
+
+#[tokio::test]
 async fn put_object_acl_does_not_truncate_the_object() {
     let server = TestServer::start().await;
     let source_file = server._source_dir.path().join("acl.txt");
@@ -480,6 +504,16 @@ async fn put_object_acl_does_not_truncate_the_object() {
         .put(format!("{}?acl", server.object_url("acl/object.txt")))
         .header("Authorization", &server.auth_header)
         .body("<AccessControlPolicy><Owner></Owner></AccessControlPolicy>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The object body is unchanged.
+    assert_eq!(server.read("acl/object.txt").await, b"acl must not clobber this");
+}
+
+#[tokio::test]
 async fn copy_object_onto_itself_is_rejected_and_preserves_content() {
     let server = TestServer::start().await;
     let source_file = server._source_dir.path().join("self.txt");
@@ -525,8 +559,6 @@ async fn copy_object_result_etag_matches_destination_head() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    // The object body is unchanged.
-    assert_eq!(server.read("acl/object.txt").await, b"acl must not clobber this");
     let body = response.text().await.unwrap();
     let start = body.find("<ETag>").unwrap() + "<ETag>".len();
     let end = body[start..].find("</ETag>").unwrap() + start;

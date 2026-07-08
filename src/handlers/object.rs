@@ -230,7 +230,6 @@ pub async fn put_object(
         return StatusCode::OK.into_response();
     }
 
-    let path = storage.join(key.trim_start_matches('/'));
     let path = match safe_join(storage, &key) {
         Some(p) => p,
         None => return S3ErrorType::AccessDenied.to_response(Some(key)),
@@ -500,6 +499,7 @@ fn parse_range(range_header: &str, file_size: u64) -> RangeRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn test_parse_range() {
@@ -524,6 +524,36 @@ mod tests {
         assert!(matches!(parse_range("bytes=-", 1000), RangeRequest::Invalid));
         assert!(matches!(parse_range("bytes=500-499", 1000), RangeRequest::Invalid));
         assert!(matches!(parse_range("wrong=0-100", 1000), RangeRequest::Invalid));
+    }
+
+    #[test]
+    fn test_safe_join() {
+        let storage = Path::new("/var/data");
+
+        // Normal keys
+        assert_eq!(safe_join(storage, "my_file.txt").unwrap(), Path::new("/var/data/my_file.txt"));
+        assert_eq!(safe_join(storage, "folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // Leading slashes are ignored (RootDir)
+        assert_eq!(safe_join(storage, "/folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // Current dir dots are ignored
+        assert_eq!(safe_join(storage, "./folder/./file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // ParentDir traversal is rejected
+        assert!(safe_join(storage, "../etc/passwd").is_none());
+        assert!(safe_join(storage, "folder/../../etc/passwd").is_none());
+
+        // Windows drive prefixes are only parsed as `Prefix` components on Windows,
+        // where they are rejected. On Unix a string like "C:/..." is just a normal
+        // (contained) key, so it resolves safely inside storage instead.
+        #[cfg(windows)]
+        assert!(safe_join(storage, "C:/Windows/System32").is_none());
+        #[cfg(not(windows))]
+        assert_eq!(
+            safe_join(storage, "C:/Windows/System32").unwrap(),
+            Path::new("/var/data/C:/Windows/System32")
+        );
     }
 }
 
@@ -582,40 +612,4 @@ fn safe_join(storage: &std::path::Path, key: &str) -> Option<std::path::PathBuf>
         }
     }
     Some(resolved)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn test_safe_join() {
-        let storage = Path::new("/var/data");
-
-        // Normal keys
-        assert_eq!(safe_join(storage, "my_file.txt").unwrap(), Path::new("/var/data/my_file.txt"));
-        assert_eq!(safe_join(storage, "folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
-
-        // Leading slashes are ignored (RootDir)
-        assert_eq!(safe_join(storage, "/folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
-
-        // Current dir dots are ignored
-        assert_eq!(safe_join(storage, "./folder/./file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
-
-        // ParentDir traversal is rejected
-        assert!(safe_join(storage, "../etc/passwd").is_none());
-        assert!(safe_join(storage, "folder/../../etc/passwd").is_none());
-
-        // Windows drive prefixes are only parsed as `Prefix` components on Windows,
-        // where they are rejected. On Unix a string like "C:/..." is just a normal
-        // (contained) key, so it resolves safely inside storage instead.
-        #[cfg(windows)]
-        assert!(safe_join(storage, "C:/Windows/System32").is_none());
-        #[cfg(not(windows))]
-        assert_eq!(
-            safe_join(storage, "C:/Windows/System32").unwrap(),
-            Path::new("/var/data/C:/Windows/System32")
-        );
-    }
 }

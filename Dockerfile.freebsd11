@@ -1,35 +1,61 @@
 FROM rustlang/rust:nightly-slim
 
-# Install dependencies
-RUN apt-get update && apt-get install -y \
-    clang \
-    lld \
-    curl \
-    xz-utils \
-    pkg-config \
-    libssl-dev \
-    git \
-    make
+# Install dependencies (retry on transient apt mirror failures, no recommends).
+RUN set -eux; \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        clang \
+        lld \
+        curl \
+        ca-certificates \
+        xz-utils \
+        pkg-config \
+        libssl-dev \
+        git \
+        make; \
+    rm -rf /var/lib/apt/lists/*
 
-# Download FreeBSD 11.2 base system for sysroot
-RUN mkdir -p /freebsd-sysroot && \
-    curl -o /tmp/base.txz https://ftpmirror.your.org/pub/FreeBSD-Archive/old-releases/amd64/11.2-RELEASE/base.txz && \
-    tar -xf /tmp/base.txz -C /freebsd-sysroot ./lib ./usr/lib ./usr/include ./usr/libdata && \
-    rm /tmp/base.txz
+# Download the FreeBSD 11.2 base system for the sysroot.
+# The single-mirror download was the main source of flaky builds, so we try a
+# list of mirrors in order, retry each on transient errors, and verify the
+# archive integrity (xz -t) before accepting it — an HTML error page from a
+# dead mirror fails the test and we fall through to the next one.
+RUN set -eux; \
+    mkdir -p /freebsd-sysroot; \
+    mirrors=" \
+      https://archive.freebsd.org/old-releases/amd64/11.2-RELEASE/base.txz \
+      https://ftpmirror.your.org/pub/FreeBSD-Archive/old-releases/amd64/11.2-RELEASE/base.txz \
+    "; \
+    ok=0; \
+    for url in $mirrors; do \
+        echo "Fetching sysroot from $url"; \
+        if curl -fL --connect-timeout 30 --retry 5 --retry-delay 5 --retry-all-errors \
+                -o /tmp/base.txz "$url" && xz -t /tmp/base.txz; then \
+            ok=1; break; \
+        fi; \
+        echo "Mirror failed, trying next: $url"; \
+        rm -f /tmp/base.txz; \
+    done; \
+    [ "$ok" -eq 1 ] || { echo "ERROR: all mirrors failed for base.txz"; exit 1; }; \
+    tar -xf /tmp/base.txz -C /freebsd-sysroot ./lib ./usr/lib ./usr/include ./usr/libdata; \
+    rm -f /tmp/base.txz
 
 # Add Rust target and rust-src
 RUN rustup target add x86_64-unknown-freebsd && \
     rustup component add rust-src
 
-# Configure Cargo to use clang and lld with the FreeBSD sysroot
-RUN mkdir -p /.cargo && \
-    echo '[target.x86_64-unknown-freebsd]\n\
-linker = "clang"\n\
-rustflags = [\n\
-  "-C", "link-arg=--target=x86_64-unknown-freebsd11",\n\
-  "-C", "link-arg=--sysroot=/freebsd-sysroot",\n\
-  "-C", "link-arg=-fuse-ld=lld"\n\
-]' > /.cargo/config.toml
+# Configure Cargo to use clang and lld with the FreeBSD sysroot.
+# Written with printf so it does not depend on the shell's `echo` interpreting
+# backslash escapes.
+RUN mkdir -p /.cargo && printf '%s\n' \
+    '[target.x86_64-unknown-freebsd]' \
+    'linker = "clang"' \
+    'rustflags = [' \
+    '  "-C", "link-arg=--target=x86_64-unknown-freebsd11",' \
+    '  "-C", "link-arg=--sysroot=/freebsd-sysroot",' \
+    '  "-C", "link-arg=-fuse-ld=lld"' \
+    ']' > /.cargo/config.toml
 
 # Set environment variables for C/C++ dependencies
 ENV CC_x86_64_unknown_freebsd="clang"
