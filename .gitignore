@@ -9,3 +9,6 @@ config.yaml
 /test_data
 /data
 /my-servers
+
+# Local, per-developer files (not part of the repo)
+/.local/
