@@ -17,6 +17,10 @@ use crate::cache::CachedStat;
 use crate::error::S3ErrorType;
 use futures_util::StreamExt;
 
+/// Read-buffer size for streaming object bodies. `ReaderStream::new` defaults to 4 KiB
+/// reads; 64 KiB cuts the per-chunk syscall/wakeup count 16x for large downloads.
+const STREAM_BUF_SIZE: usize = 64 * 1024;
+
 #[derive(Serialize)]
 #[serde(rename = "CopyObjectResult")]
 struct CopyObjectResult {
@@ -113,7 +117,7 @@ pub async fn get_object(
             RangeRequest::Satisfiable(start, end) => {
                 let range_size = end - start + 1;
                 if file.seek(io::SeekFrom::Start(start)).await.is_ok() {
-                    let stream = ReaderStream::new(file.take(range_size));
+                    let stream = ReaderStream::with_capacity(file.take(range_size), STREAM_BUF_SIZE);
                     return Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -139,7 +143,7 @@ pub async fn get_object(
         }
     }
 
-    let stream = ReaderStream::new(file);
+    let stream = ReaderStream::with_capacity(file, STREAM_BUF_SIZE);
     let body = Body::from_stream(stream);
 
     Response::builder()
