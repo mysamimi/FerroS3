@@ -17,6 +17,10 @@ use crate::cache::CachedStat;
 use crate::error::S3ErrorType;
 use futures_util::StreamExt;
 
+/// Read-buffer size for streaming object bodies. `ReaderStream::new` defaults to 4 KiB
+/// reads; 64 KiB cuts the per-chunk syscall/wakeup count 16x for large downloads.
+const STREAM_BUF_SIZE: usize = 64 * 1024;
+
 #[derive(Serialize)]
 #[serde(rename = "CopyObjectResult")]
 struct CopyObjectResult {
@@ -113,7 +117,7 @@ pub async fn get_object(
             RangeRequest::Satisfiable(start, end) => {
                 let range_size = end - start + 1;
                 if file.seek(io::SeekFrom::Start(start)).await.is_ok() {
-                    let stream = ReaderStream::new(file.take(range_size));
+                    let stream = ReaderStream::with_capacity(file.take(range_size), STREAM_BUF_SIZE);
                     return Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -139,7 +143,7 @@ pub async fn get_object(
         }
     }
 
-    let stream = ReaderStream::new(file);
+    let stream = ReaderStream::with_capacity(file, STREAM_BUF_SIZE);
     let body = Body::from_stream(stream);
 
     Response::builder()
@@ -279,9 +283,15 @@ pub async fn put_object(
         }
     }
 
-    // Flush and fsync before we claim success: a write error surfacing only on close
-    // (ENOSPC/EIO) must fail the request, not be swallowed when the file is dropped.
-    if file.flush().await.is_err() || file.sync_all().await.is_err() {
+    // Flush before we claim success: a write error surfacing only on close (ENOSPC/EIO)
+    // must fail the request, not be swallowed when the file is dropped. The fsync is
+    // configurable — it dominates small-PUT latency, and deployments where the proxy is
+    // not the source of truth may prefer to skip it.
+    if file.flush().await.is_err() {
+        let _ = fs::remove_file(&temp_path).await;
+        return S3ErrorType::InternalError.to_response(None);
+    }
+    if state.config.fsync && file.sync_all().await.is_err() {
         let _ = fs::remove_file(&temp_path).await;
         return S3ErrorType::InternalError.to_response(None);
     }
@@ -295,15 +305,21 @@ pub async fn put_object(
     // Invalidate the stat cache only after the new object is in place.
     state.cache.remove(&format!("{}/{}", bucket, key));
 
-    // Return the ETag the S3 PutObject API is expected to provide.
+    // Return the ETag the S3 PutObject API is expected to provide, and prime the stat
+    // cache with the fresh metadata so the common upload-then-HEAD pattern hits it.
     let etag = match fs::metadata(&path).await {
         Ok(metadata) => {
             let mod_time: DateTime<Utc> = metadata.modified().unwrap_or(SystemTime::now()).into();
-            format!(
+            let etag = format!(
                 "\"{:x}-{:x}\"",
                 mod_time.timestamp_nanos_opt().unwrap_or(0),
                 metadata.len()
-            )
+            );
+            state.cache.insert(
+                format!("{}/{}", bucket, key),
+                CachedStat { size: metadata.len(), mod_time, etag: etag.clone() },
+            );
+            etag
         }
         Err(_) => return S3ErrorType::InternalError.to_response(None),
     };

@@ -100,61 +100,21 @@ pub async fn list_objects(
     // Exclusive start key: ListObjects v1 uses `marker`, v2 uses `continuation-token`.
     let start_after = params.continuation_token.clone().or_else(|| params.marker.clone());
 
-    let mut file_items: Vec<ObjectContent> = Vec::new();
-    let mut common_prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-    for entry in walkdir::WalkDir::new(storage) {
-        // Skip an unreadable entry (e.g. a permission-denied subdir) instead of ending
-        // the whole walk, which would silently truncate the listing.
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if entry.file_type().is_dir() {
-            continue;
-        }
-
-        let rel_path = match entry.path().strip_prefix(storage) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        // Build the key from path components joined with '/'. This normalises the
-        // separator on Windows without mangling backslashes that are legal in Unix
-        // filenames (the old unconditional replace("\\", "/") corrupted such keys).
-        let key = rel_path_to_key(rel_path);
-
-        if !key.starts_with(&prefix) {
-            continue;
-        }
-
-        // Delimiter grouping: collapse keys with a delimiter after the prefix into a
-        // CommonPrefix. The BTreeSet de-duplicates.
-        if let Some(ref d) = delimiter {
-            let relative_to_prefix = &key[prefix.len()..];
-            if let Some(idx) = relative_to_prefix.find(d.as_str()) {
-                let common_prefix = format!("{}{}{}", prefix, &relative_to_prefix[..idx], d);
-                common_prefixes.insert(common_prefix);
-                continue;
-            }
-        }
-
-        // A file that vanished between readdir and stat (e.g. a concurrent DELETE):
-        // skip it rather than panicking on unwrap.
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let mod_time: DateTime<Utc> = metadata.modified().unwrap_or(SystemTime::now()).into();
-        let etag = format!("\"{:x}-{:x}\"", mod_time.timestamp_nanos_opt().unwrap_or(0), metadata.len());
-
-        file_items.push(ObjectContent {
-            key,
-            last_modified: mod_time.to_rfc3339(),
-            etag,
-            size: metadata.len(),
-            storage_class: "STANDARD".to_string(),
-        });
-    }
+    // Walk the bucket on a blocking thread: `walkdir` and the per-entry `stat` calls are
+    // synchronous, so running them directly on an async worker would block the runtime for
+    // the entire traversal. The walk is also scoped to the subtree implied by `prefix`, so
+    // a prefixed listing visits only matching directories instead of the whole bucket.
+    let storage = storage.clone();
+    let walk_prefix = prefix.clone();
+    let walk_delimiter = delimiter.clone();
+    let (file_items, common_prefixes) = match tokio::task::spawn_blocking(move || {
+        collect_entries(&storage, &walk_prefix, walk_delimiter.as_deref())
+    })
+    .await
+    {
+        Ok(collected) => collected,
+        Err(_) => return S3ErrorType::InternalError.to_response(None),
+    };
 
     // Merge files and common prefixes into one key-sorted sequence so results are
     // returned in ascending UTF-8 key order (the S3 guarantee) and pagination is stable.
@@ -222,6 +182,102 @@ pub async fn list_objects(
         .unwrap()
 }
 
+/// Walk `storage` (scoped to the prefix's subtree) and collect matching objects and, when
+/// a `delimiter` is given, their collapsed common prefixes. Blocking: `walkdir` and
+/// `entry.metadata()` are synchronous, so this runs on a `spawn_blocking` thread.
+fn collect_entries(
+    storage: &std::path::Path,
+    prefix: &str,
+    delimiter: Option<&str>,
+) -> (Vec<ObjectContent>, std::collections::BTreeSet<String>) {
+    let mut file_items: Vec<ObjectContent> = Vec::new();
+    let mut common_prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // Root the walk at the deepest directory the prefix guarantees. An escaping prefix
+    // matches no valid key (keys never contain `..`), so return nothing.
+    let search_root = match prefix_search_root(storage, prefix) {
+        Some(root) => root,
+        None => return (file_items, common_prefixes),
+    };
+
+    for entry in walkdir::WalkDir::new(&search_root) {
+        // Skip an unreadable entry (e.g. a permission-denied subdir) instead of ending
+        // the whole walk, which would silently truncate the listing.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.file_type().is_dir() {
+            continue;
+        }
+
+        // Keys are always relative to `storage`, not the (possibly deeper) walk root.
+        let rel_path = match entry.path().strip_prefix(storage) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Build the key from path components joined with '/'. This normalises the
+        // separator on Windows without mangling backslashes that are legal in Unix
+        // filenames (the old unconditional replace("\\", "/") corrupted such keys).
+        let key = rel_path_to_key(rel_path);
+
+        if !key.starts_with(prefix) {
+            continue;
+        }
+
+        // Delimiter grouping: collapse keys with a delimiter after the prefix into a
+        // CommonPrefix. The BTreeSet de-duplicates.
+        if let Some(d) = delimiter {
+            let relative_to_prefix = &key[prefix.len()..];
+            if let Some(idx) = relative_to_prefix.find(d) {
+                let common_prefix = format!("{}{}{}", prefix, &relative_to_prefix[..idx], d);
+                common_prefixes.insert(common_prefix);
+                continue;
+            }
+        }
+
+        // A file that vanished between readdir and stat (e.g. a concurrent DELETE):
+        // skip it rather than panicking on unwrap.
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mod_time: DateTime<Utc> = metadata.modified().unwrap_or(SystemTime::now()).into();
+        let etag = format!("\"{:x}-{:x}\"", mod_time.timestamp_nanos_opt().unwrap_or(0), metadata.len());
+
+        file_items.push(ObjectContent {
+            key,
+            last_modified: mod_time.to_rfc3339(),
+            etag,
+            size: metadata.len(),
+            storage_class: "STANDARD".to_string(),
+        });
+    }
+
+    (file_items, common_prefixes)
+}
+
+/// Derive the deepest directory a prefixed walk can start from. The prefix is split at its
+/// last '/': the leading path becomes a subdirectory of `storage` that roots the walk,
+/// while the trailing segment stays a filename filter applied to keys (so `logs/2024`
+/// still matches both `logs/2024.txt` and `logs/2024/jan.txt`). Returns `None` when the
+/// prefix path would escape `storage`.
+fn prefix_search_root(storage: &std::path::Path, prefix: &str) -> Option<std::path::PathBuf> {
+    let dir_part = match prefix.rfind('/') {
+        Some(idx) => &prefix[..idx],
+        None => return Some(storage.to_path_buf()),
+    };
+    let mut root = storage.to_path_buf();
+    for component in std::path::Path::new(dir_part).components() {
+        match component {
+            std::path::Component::Normal(c) => root.push(c),
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Prefix(_) | std::path::Component::ParentDir => return None,
+        }
+    }
+    Some(root)
+}
+
 /// Turn a storage-relative path into an S3 key by joining its `Normal` components with
 /// '/'. On Unix this preserves backslashes that are legal in filenames; on Windows it
 /// normalises the native '\' separators to '/'.
@@ -240,7 +296,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::collections::HashMap;
-    use dashmap::DashMap;
+    use quick_cache::sync::Cache;
     use tokio::fs;
     use axum::body::to_bytes;
     use crate::config::{Config, BucketConfig};
@@ -254,13 +310,14 @@ mod tests {
             endpoint: "0.0.0.0".to_string(),
             verbose: false,
             cache_size: 10,
+            fsync: true,
             auth: None,
             buckets: vec![BucketConfig { name: bucket_name.to_string(), storage: storage_path.to_string() }],
         };
 
         Arc::new(AppState {
             config,
-            cache: DashMap::new(),
+            cache: Cache::new(10),
             storage_map,
         })
     }
@@ -411,6 +468,74 @@ mod tests {
         assert!(!xml.contains("<Key>a.txt</Key>"), "marker should exclude a.txt: {xml}");
         assert!(xml.contains("<Key>b.txt</Key>"));
         assert!(xml.contains("<Key>c.txt</Key>"));
+
+        let _ = fs::remove_dir_all(storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_prefix_returns_matching_subtree() {
+        let storage = "./test_list_data_prefix";
+        let bucket = "test_bucket";
+        let _ = fs::remove_dir_all(storage).await;
+        fs::create_dir_all(storage).await.unwrap();
+        create_test_files(
+            storage,
+            &[
+                "photos/2024/a.jpg",
+                "photos/2024/b.jpg",
+                "photos/2023/c.jpg",
+                "docs/readme.txt",
+            ],
+        )
+        .await;
+        let state = setup_test_state(bucket, storage).await;
+
+        // Prefix ending in '/': walk is rooted at photos/2024, only those keys returned.
+        let params = ListObjectsParams {
+            prefix: Some("photos/2024/".to_string()),
+            delimiter: None,
+            marker: None,
+            max_keys: Some(1000),
+            list_type: Some(2),
+            continuation_token: None,
+        };
+        let xml = list_xml(&state, bucket, params).await;
+        assert!(xml.contains("<Key>photos/2024/a.jpg</Key>"), "{xml}");
+        assert!(xml.contains("<Key>photos/2024/b.jpg</Key>"), "{xml}");
+        assert!(!xml.contains("photos/2023"), "{xml}");
+        assert!(!xml.contains("docs/readme.txt"), "{xml}");
+        assert!(xml.contains("<KeyCount>2</KeyCount>"), "{xml}");
+
+        let _ = fs::remove_dir_all(storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_prefix_without_trailing_slash_spans_boundary() {
+        // A prefix whose last segment is a partial name must still match both a file and a
+        // directory sharing that partial name, since the walk roots at the parent dir.
+        let storage = "./test_list_data_prefix_partial";
+        let bucket = "test_bucket";
+        let _ = fs::remove_dir_all(storage).await;
+        fs::create_dir_all(storage).await.unwrap();
+        create_test_files(
+            storage,
+            &["logs/2024.txt", "logs/2024/jan.txt", "logs/2025.txt"],
+        )
+        .await;
+        let state = setup_test_state(bucket, storage).await;
+
+        let params = ListObjectsParams {
+            prefix: Some("logs/2024".to_string()),
+            delimiter: None,
+            marker: None,
+            max_keys: Some(1000),
+            list_type: Some(2),
+            continuation_token: None,
+        };
+        let xml = list_xml(&state, bucket, params).await;
+        assert!(xml.contains("<Key>logs/2024.txt</Key>"), "{xml}");
+        assert!(xml.contains("<Key>logs/2024/jan.txt</Key>"), "{xml}");
+        assert!(!xml.contains("logs/2025.txt"), "{xml}");
 
         let _ = fs::remove_dir_all(storage).await;
     }

@@ -1,18 +1,22 @@
 use ferros3::{build_app, build_state, load_config};
 
 #[cfg(target_os = "freebsd")]
-use axum::body::{to_bytes, Body};
+use axum::body::Body;
 #[cfg(target_os = "freebsd")]
-use axum::http::{HeaderMap, Method, Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
 #[cfg(target_os = "freebsd")]
 use axum::response::IntoResponse;
 #[cfg(target_os = "freebsd")]
 use axum::Router;
 #[cfg(target_os = "freebsd")]
 use ferros3::blocking_http::{
-    body_plan, format_response_head, parse_request_head, read_body, wants_100_continue,
-    MAX_BODY_BYTES,
+    body_plan, format_response_head, parse_request_head, read_body, request_keep_alive,
+    wants_100_continue, MAX_BODY_BYTES,
 };
+#[cfg(target_os = "freebsd")]
+use http_body_util::BodyExt;
+#[cfg(target_os = "freebsd")]
+use hyper::body::Body as HttpBody;
 #[cfg(target_os = "freebsd")]
 use std::{
     io::{self, BufReader, Write},
@@ -26,12 +30,6 @@ use tower::ServiceExt;
 /// (a pre-auth resource-exhaustion vector).
 #[cfg(target_os = "freebsd")]
 const MAX_CONNECTIONS: usize = 512;
-
-/// Upper bound on a buffered response body. The blocking shim buffers the whole response;
-/// this prevents an unbounded allocation (the old `to_bytes(body, usize::MAX)`). Fully
-/// streaming the body without buffering remains a follow-up.
-#[cfg(target_os = "freebsd")]
-const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 #[cfg(not(target_os = "freebsd"))]
 #[tokio::main]
@@ -100,78 +98,80 @@ fn serve_blocking_connection(
     handle: tokio::runtime::Handle,
 ) -> io::Result<()> {
     stream.set_nodelay(true).ok();
-    let (request, method) = read_http_request(&mut stream)?;
-    let head_only = method == Method::HEAD;
 
-    handle.block_on(async move {
-        let response = app
-            .oneshot(request)
-            .await
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-        let (parts, body) = response.into_parts();
-
-        // Buffer the body under a hard cap. A mid-stream read error now becomes a clean
-        // 500 rather than a bogus empty 200 (the old to_bytes(usize::MAX).unwrap_or_default()).
-        match to_bytes(body, MAX_RESPONSE_BYTES).await {
-            Ok(body_bytes) => {
-                write_http_response(&mut stream, parts.status, &parts.headers, body_bytes, head_only)
-            }
-            Err(_) => write_http_response(
-                &mut stream,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &HeaderMap::new(),
-                bytes::Bytes::new(),
-                head_only,
-            ),
-        }
-    })
-}
-
-#[cfg(target_os = "freebsd")]
-fn read_http_request(stream: &mut StdTcpStream) -> io::Result<(Request<Body>, Method)> {
+    // One reader for the connection's whole lifetime: bytes it buffers past one
+    // request's body are the start of the next request, and a per-request reader
+    // would silently discard them.
     let mut reader = BufReader::new(stream.try_clone()?);
 
-    // Request line + headers (parsed by the host-tested `blocking_http` module).
-    let head = parse_request_head(&mut reader)?;
+    // Keep-alive loop: serve requests until the client closes, asks to close, or a
+    // response's length can't be framed for reuse.
+    loop {
+        let head = match parse_request_head(&mut reader) {
+            Ok(head) => head,
+            // Client closed the connection between requests: a normal end, not an error.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let head_only = head.method == Method::HEAD;
+        let client_keep_alive = request_keep_alive(head.http11, &head.headers);
 
-    // Honor `Expect: 100-continue` before reading the body, or standard clients stall
-    // waiting for the interim response.
-    if wants_100_continue(&head.headers) {
-        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        // Honor `Expect: 100-continue` before reading the body, or standard clients
+        // stall waiting for the interim response.
+        if wants_100_continue(&head.headers) {
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            stream.flush()?;
+        }
+
+        // Read the body per its framing (Content-Length or chunked), bounded so a huge
+        // declared length can't pre-allocate gigabytes.
+        let body = read_body(&mut reader, body_plan(&head.headers), MAX_BODY_BYTES)?;
+
+        let mut builder = Request::builder().method(head.method).uri(head.target);
+        if let Some(headers_mut) = builder.headers_mut() {
+            *headers_mut = head.headers;
+        }
+        let request = builder
+            .body(Body::from(body))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "failed to build request"))?;
+
+        let response = handle
+            .block_on(app.clone().oneshot(request))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        let (parts, mut body) = response.into_parts();
+
+        // A body with an exact size hint (every handler response: file streams sized by
+        // Content-Length/take, full buffers, empties) can be framed for keep-alive. An
+        // unknown length falls back to close-delimited framing.
+        let exact_len = HttpBody::size_hint(&body).exact();
+        let keep_alive = client_keep_alive && (head_only || exact_len.is_some());
+
+        let response_head =
+            format_response_head(parts.status, &parts.headers, exact_len, head_only, keep_alive);
+        stream.write_all(response_head.as_bytes())?;
+
+        if !head_only {
+            // Stream body frames to the socket as they arrive, instead of buffering the
+            // whole response in memory (the old to_bytes held up to 2 GiB per connection).
+            handle.block_on(async {
+                while let Some(frame) = body.frame().await {
+                    let frame = frame.map_err(|_| {
+                        // Mid-stream failure after the head is sent: the head (status,
+                        // framing) is already on the wire, so the only honest signal
+                        // left is dropping the connection.
+                        io::Error::new(io::ErrorKind::Other, "response body stream error")
+                    })?;
+                    if let Some(data) = frame.data_ref() {
+                        stream.write_all(data)?;
+                    }
+                }
+                Ok::<_, io::Error>(())
+            })?;
+        }
         stream.flush()?;
+
+        if !keep_alive {
+            return Ok(());
+        }
     }
-
-    // Read the body per its framing (Content-Length or chunked), bounded so a huge
-    // declared length can't pre-allocate gigabytes.
-    let body = read_body(&mut reader, body_plan(&head.headers), MAX_BODY_BYTES)?;
-
-    let method = head.method.clone();
-    let mut builder = Request::builder().method(head.method).uri(head.target);
-    if let Some(headers_mut) = builder.headers_mut() {
-        *headers_mut = head.headers;
-    }
-    let request = builder
-        .body(Body::from(body))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "failed to build request"))?;
-
-    Ok((request, method))
-}
-
-#[cfg(target_os = "freebsd")]
-fn write_http_response(
-    stream: &mut StdTcpStream,
-    status: StatusCode,
-    headers: &HeaderMap,
-    body_bytes: bytes::Bytes,
-    head_only: bool,
-) -> io::Result<()> {
-    // format_response_head (host-tested) preserves the handler's Content-Length for HEAD
-    // instead of overwriting it with the empty body length.
-    let head = format_response_head(status, headers, body_bytes.len(), head_only);
-    stream.write_all(head.as_bytes())?;
-    if !head_only {
-        stream.write_all(&body_bytes)?;
-    }
-    stream.flush()?;
-    Ok(())
 }

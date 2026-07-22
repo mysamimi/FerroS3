@@ -20,16 +20,23 @@ md-5 = "0.10"
 quick-xml = { version = "0.36", features = ["serialize"] }
 bytes = "1.0"
 http = "1.0"
-tower-http = { version = "=0.5.2", features = ["full"] }
 walkdir = "2.3"
 mime_guess = "2.0"
 urlencoding = "2.1"
-dashmap = "6.0" # Thread-safe cache
 tokio-util = { version = "0.7", features = ["io"] }
 tower = { version = "0.4", features = ["util"] }
 futures-util = "0.3"
 hex = "0.4"
 utoipa = { version = "5", features = ["axum_extras", "chrono"] }
+quick_cache = "0.7.0"
+http-body-util = "0.1"
+
+[profile.release]
+# Cross-crate inlining matters here: hot paths (axum routing, tokio I/O, sha2/hmac
+# signing) span many small crates. Thin LTO + one codegen unit lets LLVM optimise
+# across those boundaries; the cost is release build time only.
+lto = "thin"
+codegen-units = 1
 
 [build-dependencies]
 cc = "1.0"

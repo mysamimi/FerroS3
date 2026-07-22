@@ -26,6 +26,8 @@ pub struct RequestHead {
     pub method: Method,
     pub target: String,
     pub headers: HeaderMap,
+    /// True when the request line declared HTTP/1.1 (affects keep-alive defaults).
+    pub http11: bool,
 }
 
 /// Parse the request line and headers from `reader`, leaving it positioned at the body.
@@ -44,6 +46,7 @@ pub fn parse_request_head<R: BufRead>(reader: &mut R) -> io::Result<RequestHead>
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing target"))?
         .to_string();
+    let http11 = parts.next() == Some("HTTP/1.1");
     let method = Method::from_bytes(method.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid method"))?;
 
@@ -67,7 +70,22 @@ pub fn parse_request_head<R: BufRead>(reader: &mut R) -> io::Result<RequestHead>
         headers.append(header_name, header_value);
     }
 
-    Ok(RequestHead { method, target, headers })
+    Ok(RequestHead { method, target, headers, http11 })
+}
+
+/// Whether the client can receive further responses on this connection. HTTP/1.1
+/// defaults to keep-alive unless the request says `Connection: close`; HTTP/1.0
+/// defaults to close unless it says `Connection: keep-alive`.
+pub fn request_keep_alive(http11: bool, headers: &HeaderMap) -> bool {
+    let connection = headers
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if http11 {
+        !connection.eq_ignore_ascii_case("close")
+    } else {
+        connection.eq_ignore_ascii_case("keep-alive")
+    }
 }
 
 /// Decide how the body is framed. Per RFC 7230, `Transfer-Encoding: chunked` takes
@@ -153,26 +171,39 @@ fn read_chunked<R: BufRead>(reader: &mut R, limit: usize) -> io::Result<Vec<u8>>
 ///
 /// For a HEAD response the handler sets `Content-Length` to the object size but sends an
 /// empty body; we must echo that size, not overwrite it with the empty body's length.
+///
+/// `body_len: None` means the body length is unknown up front (a stream without an exact
+/// size hint): no `Content-Length` is written and the body is delimited by connection
+/// close, so the caller must pass `keep_alive: false`.
 pub fn format_response_head(
     status: StatusCode,
     headers: &HeaderMap,
-    body_len: usize,
+    body_len: Option<u64>,
     head_only: bool,
+    keep_alive: bool,
 ) -> String {
     let reason = status.canonical_reason().unwrap_or("");
     let mut head = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason);
-    head.push_str("Connection: close\r\n");
+    head.push_str(if keep_alive {
+        "Connection: keep-alive\r\n"
+    } else {
+        "Connection: close\r\n"
+    });
 
     let content_length = if head_only {
-        headers
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0)
+        Some(
+            headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0),
+        )
     } else {
-        body_len as u64
+        body_len
     };
-    head.push_str(&format!("Content-Length: {}\r\n", content_length));
+    if let Some(n) = content_length {
+        head.push_str(&format!("Content-Length: {}\r\n", n));
+    }
 
     for (name, value) in headers.iter() {
         if name == header::CONTENT_LENGTH || name == header::CONNECTION {
@@ -272,7 +303,7 @@ mod tests {
     fn head_response_preserves_content_length() {
         // HEAD: handler set Content-Length to the object size but sends an empty body.
         let h = headers(&[("Content-Length", "12345"), ("ETag", "\"abc\"")]);
-        let out = format_response_head(StatusCode::OK, &h, 0, true);
+        let out = format_response_head(StatusCode::OK, &h, None, true, false);
         assert!(out.contains("Content-Length: 12345\r\n"), "{out}");
         // HeaderMap normalises names to lowercase; HTTP header names are case-insensitive.
         assert!(out.contains("etag: \"abc\"\r\n"), "{out}");
@@ -283,9 +314,45 @@ mod tests {
     #[test]
     fn get_response_uses_body_length() {
         let h = headers(&[("Content-Type", "application/octet-stream")]);
-        let out = format_response_head(StatusCode::OK, &h, 987, false);
+        let out = format_response_head(StatusCode::OK, &h, Some(987), false, false);
         assert!(out.contains("Content-Length: 987\r\n"), "{out}");
         // Connection: close is always present and written once.
         assert_eq!(out.matches("Connection: close").count(), 1);
+    }
+
+    #[test]
+    fn keep_alive_response_head() {
+        let h = headers(&[]);
+        let out = format_response_head(StatusCode::OK, &h, Some(5), false, true);
+        assert!(out.contains("Connection: keep-alive\r\n"), "{out}");
+        assert!(!out.contains("Connection: close"), "{out}");
+    }
+
+    #[test]
+    fn unknown_length_body_omits_content_length() {
+        // A stream without an exact size hint is delimited by connection close.
+        let h = headers(&[]);
+        let out = format_response_head(StatusCode::OK, &h, None, false, false);
+        assert!(!out.contains("Content-Length"), "{out}");
+        assert!(out.contains("Connection: close\r\n"), "{out}");
+    }
+
+    #[test]
+    fn parse_request_head_detects_http_version() {
+        let mut r = Cursor::new(&b"GET /k HTTP/1.1\r\n\r\n"[..]);
+        assert!(parse_request_head(&mut r).unwrap().http11);
+        let mut r = Cursor::new(&b"GET /k HTTP/1.0\r\n\r\n"[..]);
+        assert!(!parse_request_head(&mut r).unwrap().http11);
+    }
+
+    #[test]
+    fn request_keep_alive_defaults_by_version() {
+        // HTTP/1.1: keep-alive unless the client says close.
+        assert!(request_keep_alive(true, &headers(&[])));
+        assert!(!request_keep_alive(true, &headers(&[("Connection", "close")])));
+        assert!(!request_keep_alive(true, &headers(&[("Connection", "Close")])));
+        // HTTP/1.0: close unless the client asks for keep-alive.
+        assert!(!request_keep_alive(false, &headers(&[])));
+        assert!(request_keep_alive(false, &headers(&[("Connection", "keep-alive")])));
     }
 }
