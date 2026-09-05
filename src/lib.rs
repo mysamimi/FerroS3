@@ -7,12 +7,19 @@ pub mod handlers;
 pub mod openapi;
 pub mod state;
 
-use axum::{middleware, routing::get, Router};
+use axum::{
+    extract::{Request, State},
+    middleware::{self, Next},
+    response::Response,
+    routing::get,
+    Router,
+};
 use quick_cache::sync::Cache;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
 
 use crate::auth::auth_middleware;
+use crate::error::S3ErrorType;
 use crate::config::Config;
 use crate::handlers::admin::generate_presigned_url;
 use crate::handlers::bucket::{head_bucket, list_buckets};
@@ -62,7 +69,48 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             state.clone(),
             auth_middleware,
         ))
+        // Outermost, so it also bounds auth: the last layer added wraps everything
+        // registered before it.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            timeout_middleware,
+        ))
         .with_state(state)
+}
+
+/// Bound how long a request may take to produce a response, so a hung storage mount
+/// (an NFS server that stopped answering, a disk in permanent I/O wait) fails the
+/// request instead of holding the connection open forever.
+///
+/// Two things are deliberately outside the bound:
+/// * Requests carrying a body (PUT/POST). The handler consumes the upload inside this
+///   future, so the elapsed time is the client's upload speed — a legitimately slow
+///   1 GiB PUT must not be cut off.
+/// * Streaming the response body. The future resolves once the response head and body
+///   stream are built, so a slow client downloading a large object is unaffected.
+///
+/// A timed-out request is abandoned, not cancelled: a `spawn_blocking` walk already
+/// stuck in a syscall keeps running on its blocking thread until the filesystem
+/// answers. The bound protects the client and the connection, not the thread pool.
+async fn timeout_middleware(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    let seconds = state.config.request_timeout_secs;
+    let has_body = matches!(*req.method(), axum::http::Method::PUT | axum::http::Method::POST);
+    if seconds == 0 || has_body {
+        return next.run(req).await;
+    }
+
+    let verbose = state.config.verbose;
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    match tokio::time::timeout(Duration::from_secs(seconds), next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => {
+            if verbose {
+                println!("  [!] Timed out after {seconds}s: {method} {path}");
+            }
+            S3ErrorType::RequestTimeout.to_response(None)
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -86,7 +134,72 @@ pub fn build_app(state: Arc<AppState>) -> Router {
 mod tests {
     use super::*;
     use crate::cache::CachedStat;
+    use crate::config::BucketConfig;
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::routing::put;
     use chrono::Utc;
+    use tower::ServiceExt;
+
+    fn timeout_state(seconds: u64) -> Arc<AppState> {
+        build_state(&Config {
+            port: 0,
+            endpoint: String::new(),
+            verbose: false,
+            cache_size: 8,
+            fsync: true,
+            request_timeout_secs: seconds,
+            auth: None,
+            buckets: Vec::<BucketConfig>::new(),
+        })
+    }
+
+    /// A router whose only route sleeps for 5s behind the timeout middleware. Tests run
+    /// with a paused clock, so the sleep is virtual and the assertion is instant.
+    fn slow_app(state: Arc<AppState>, method: &str) -> Router {
+        let slow = || async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            "done"
+        };
+        let route = if method == "PUT" { put(slow) } else { get(slow) };
+        Router::new()
+            .route("/slow", route)
+            .layer(middleware::from_fn_with_state(state.clone(), timeout_middleware))
+            .with_state(state)
+    }
+
+    async fn status_of(app: Router, method: &str) -> StatusCode {
+        let request = Request::builder()
+            .method(method)
+            .uri("/slow")
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_request_times_out_instead_of_hanging() {
+        // A handler stuck on unresponsive storage must not hold the connection open.
+        let state = timeout_state(1);
+        assert_eq!(
+            status_of(slow_app(state, "GET"), "GET").await,
+            StatusCode::GATEWAY_TIMEOUT
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_timeout_disables_the_bound() {
+        let state = timeout_state(0);
+        assert_eq!(status_of(slow_app(state, "GET"), "GET").await, StatusCode::OK);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uploads_are_exempt_from_the_timeout() {
+        // A PUT's duration is the client's upload speed; cutting it off would break
+        // legitimately slow large uploads.
+        let state = timeout_state(1);
+        assert_eq!(status_of(slow_app(state, "PUT"), "PUT").await, StatusCode::OK);
+    }
 
     #[test]
     fn stat_cache_is_bounded_by_cache_size() {
@@ -96,6 +209,7 @@ mod tests {
             verbose: false,
             cache_size: 8,
             fsync: true,
+            request_timeout_secs: 30,
             auth: None,
             buckets: vec![],
         };

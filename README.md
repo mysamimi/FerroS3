@@ -50,6 +50,8 @@ port: 8080
 endpoint: "0.0.0.0"
 verbose: true
 cache_size: 10000
+# Fail a stalled request after this many seconds (0 disables). Uploads are exempt.
+request_timeout_secs: 30
 auth:
   access_key: "YOUR_ACCESS_KEY"
   secret_key: "YOUR_SECRET_KEY"

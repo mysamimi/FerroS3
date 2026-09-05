@@ -25,6 +25,7 @@ pub enum S3ErrorType {
     AccessDenied,
     InvalidRequest,
     InternalError,
+    RequestTimeout,
     // Add more as needed
 }
 
@@ -78,6 +79,11 @@ impl S3ErrorType {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
                 "An internal error occurred.",
+            ),
+            S3ErrorType::RequestTimeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "RequestTimeout",
+                "The server took too long to handle the request and gave up.",
             ),
         };
 

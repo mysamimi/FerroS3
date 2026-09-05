@@ -22,6 +22,8 @@ The runtime configuration is read from `config.yaml` in the current working dire
 | `endpoint` | string | yes | Interface/address to bind. |
 | `verbose` | boolean | yes | Enables request logging in the auth middleware. |
 | `cache_size` | integer | no | In-memory stat cache size. Defaults to `10000`. |
+| `fsync` | boolean | no | Fsync each uploaded object before acknowledging the PUT. Defaults to `true`. |
+| `request_timeout_secs` | integer | no | Seconds a request may take to produce a response before it fails with `504 RequestTimeout`. Defaults to `30`; `0` disables. Body-carrying requests (PUT/POST) and response-body streaming are exempt. |
 | `auth` | object | no | Enables request authentication when present. |
 | `auth.access_key` | string | yes, when `auth` exists | Access key used by simple auth and SigV4. |
 | `auth.secret_key` | string | yes, when `auth` exists | Secret key used by SigV4. |

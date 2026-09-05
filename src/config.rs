@@ -24,6 +24,14 @@ pub struct Config {
     /// cache or replica rather than the source of truth.
     #[serde(default = "default_fsync")]
     pub fsync: bool,
+    /// Give up on a request that hasn't produced a response within this many seconds
+    /// (0 disables). It bounds handler work — the ListObjects walk, the stat calls —
+    /// so a hung storage mount fails the request instead of holding the connection
+    /// open forever. Requests that carry a body (PUT/POST) are exempt: their duration
+    /// is the client's upload speed, not the server's, and so is streaming a response
+    /// body, which the timeout also does not cover.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
     pub auth: Option<AuthConfig>,
     pub buckets: Vec<BucketConfig>,
 }
@@ -34,6 +42,10 @@ fn default_cache_size() -> usize {
 
 fn default_fsync() -> bool {
     true
+}
+
+fn default_request_timeout_secs() -> u64 {
+    30
 }
 
 #[cfg(test)]
@@ -47,5 +59,6 @@ mod tests {
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.fsync);
         assert_eq!(config.cache_size, 10000);
+        assert_eq!(config.request_timeout_secs, 30);
     }
 }

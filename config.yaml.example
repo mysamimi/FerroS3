@@ -6,6 +6,10 @@ cache_size: 10000
 # Fsync each uploaded object before acknowledging the PUT (default true). Set to false
 # to trade crash durability for PUT latency when this proxy is not the source of truth.
 fsync: true
+# Give up on a request that hasn't produced a response within this many seconds, so a
+# hung storage mount fails the request instead of holding the connection open forever.
+# Set to 0 to disable. Uploads (PUT/POST) and response-body streaming are not bounded.
+request_timeout_secs: 30
 auth:
   access_key: "YOUR_ACCESS_KEY"
   secret_key: "YOUR_SECRET_KEY"
