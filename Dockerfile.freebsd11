@@ -1,8 +1,20 @@
 FROM rustlang/rust:nightly-slim
 
+# Debian mirror to install from. deb.debian.org is unusably slow on some
+# networks (a few kB/s), which is what turned this layer into a 13-minute
+# download that eventually got OOM-killed. build-freebsd11.sh probes a list of
+# mirrors and passes the fastest reachable one in; these defaults keep a plain
+# `docker build` pointed at upstream.
+ARG DEBIAN_MIRROR=http://deb.debian.org/debian
+ARG DEBIAN_SECURITY_MIRROR=http://deb.debian.org/debian-security
+
 # Install dependencies (retry on transient apt mirror failures, no recommends).
 RUN set -eux; \
     echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
+    sed -i \
+        -e "s|^URIs: .*/debian-security$|URIs: ${DEBIAN_SECURITY_MIRROR}|" \
+        -e "s|^URIs: .*/debian$|URIs: ${DEBIAN_MIRROR}|" \
+        /etc/apt/sources.list.d/debian.sources; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         clang \
@@ -45,17 +57,54 @@ RUN set -eux; \
 RUN rustup target add x86_64-unknown-freebsd && \
     rustup component add rust-src
 
+# Teach std's readdir that FreeBSD 11's d_fileno is 32 bits.
+#
+# Rust dropped FreeBSD 11 from its supported baseline, so std now assumes the
+# ino64 dirent unconditionally on FreeBSD: it moves `d_fileno` straight into a
+# u64 field with no cast. Under the freebsd11 ABI selected below that stops
+# compiling ("expected u64, found u32"), which is std telling us it was written
+# for FreeBSD 12+. The generic branch two lines down already casts; this makes
+# the FreeBSD branch do the same, which is a no-op on a 64-bit d_fileno.
+#
+# The greps are the point of the RUN: if a future nightly rewrites this code the
+# build fails here, loudly, instead of quietly producing a binary whose
+# directory listings are garbage on the target host.
+RUN set -eux; \
+    f="$(rustc --print sysroot)/lib/rustlib/src/rust/library/std/src/sys/fs/unix.rs"; \
+    grep -q 'd_ino: (\*entry_ptr)\.d_fileno,' "$f"; \
+    sed -i 's|d_ino: (\*entry_ptr)\.d_fileno,|d_ino: (*entry_ptr).d_fileno as u64,|' "$f"; \
+    grep -q 'd_ino: (\*entry_ptr)\.d_fileno as u64,' "$f"
+
 # Configure Cargo to use clang and lld with the FreeBSD sysroot.
 # Written with printf so it does not depend on the shell's `echo` interpreting
 # backslash escapes.
+#
+# The `libc_unstable_freebsd_version` cfg is what actually makes this a
+# FreeBSD 11 binary, and it is not optional. FreeBSD 12.0 widened ino_t to 64
+# bits ("ino64"), which changed the layout of `struct stat` and `struct dirent`.
+# The `libc` crate defaults to the FreeBSD 12 layouts regardless of the sysroot
+# we link against, so without this cfg every `stat` and `readdir` in std reads
+# its fields at the wrong offsets on an 11.x host: directory listings come back
+# with empty names and duplicate entries, and file sizes and mtimes are
+# garbage (a 1764-byte file reported as 169321389 bytes, dated 1975).
+#
+# The cfg only reaches std because build-freebsd11.sh builds with `-Z build-std`
+# — a prebuilt std from rustup is compiled against the FreeBSD 12 ABI and cannot
+# be fixed here.
 RUN mkdir -p /.cargo && printf '%s\n' \
     '[target.x86_64-unknown-freebsd]' \
     'linker = "clang"' \
     'rustflags = [' \
+    '  "--cfg", "libc_unstable_freebsd_version=\"11\"",' \
     '  "-C", "link-arg=--target=x86_64-unknown-freebsd11",' \
     '  "-C", "link-arg=--sysroot=/freebsd-sysroot",' \
     '  "-C", "link-arg=-fuse-ld=lld"' \
     ']' > /.cargo/config.toml
+
+# Older `libc` releases took the FreeBSD version from this environment variable
+# instead of the cfg above; newer ones ignore it with a warning. Both are set so
+# the ABI stays correct whichever `libc` the current nightly's std pulls in.
+ENV RUST_LIBC_UNSTABLE_FREEBSD_VERSION=11
 
 # Set environment variables for C/C++ dependencies
 ENV CC_x86_64_unknown_freebsd="clang"
