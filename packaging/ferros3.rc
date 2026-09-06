@@ -1,0 +1,62 @@
+#!/bin/sh
+#
+# PROVIDE: ferros3
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+#
+# ferros3 S3-compatible object storage server.
+#
+# Enable in /etc/rc.conf:
+#   ferros3_enable="YES"
+#
+# Optional overrides:
+#   ferros3_dir="/app"      # holds both the binary and its config.yaml
+#   ferros3_user="root"     # needs read access to the storage mounts
+
+. /etc/rc.subr
+
+name="ferros3"
+rcvar="ferros3_enable"
+
+load_rc_config $name
+
+: ${ferros3_enable:="NO"}
+: ${ferros3_dir:="/app"}
+: ${ferros3_user:="root"}
+
+# daemon(8) supervises the server: -r restarts it if it exits, and -S sends its stdout
+# and stderr to syslog under the tag set by -T. Syslog rather than a plain file on
+# purpose: newsyslog rotates by HUPing syslogd, which reopens the file, whereas
+# `daemon -o` would keep writing into the rotated-away inode forever.
+#
+# Two pidfiles: -P tracks the supervisor (the process rc must signal, hence $pidfile and
+# $procname below point at daemon(8)) and -p tracks the server itself, which is the one
+# worth looking up by hand. Signalling the supervisor is what stops the pair — daemon(8)
+# forwards SIGTERM to its child and then exits.
+pidfile="/var/run/${name}.supervisor.pid"
+child_pidfile="/var/run/${name}.pid"
+procname="/usr/sbin/daemon"
+
+start_cmd="ferros3_start"
+
+ferros3_start()
+{
+    if [ ! -x "${ferros3_dir}/${name}" ]; then
+        err 1 "${ferros3_dir}/${name} is missing or not executable"
+    fi
+
+    echo "Starting ${name}."
+    # cd first: ferros3 reads "config.yaml" as a relative path, and daemon(8) on this
+    # release has no option to set a working directory for the child.
+    cd "${ferros3_dir}" || err 1 "cannot cd to ${ferros3_dir}"
+    /usr/sbin/daemon \
+        -r \
+        -P "${pidfile}" \
+        -p "${child_pidfile}" \
+        -S \
+        -T "${name}" \
+        -u "${ferros3_user}" \
+        "${ferros3_dir}/${name}"
+}
+
+run_rc_command "$1"

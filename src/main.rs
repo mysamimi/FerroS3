@@ -34,6 +34,10 @@ const MAX_CONNECTIONS: usize = 512;
 #[cfg(not(target_os = "freebsd"))]
 #[tokio::main]
 async fn main() {
+    // First line in the log: which build this is. Deploys are bare rsynced binaries, so
+    // without this there is no way to tell from the outside what a server is running.
+    println!("{}", ferros3::build_stamp());
+
     let config = load_config().await;
     let state = build_state(&config);
     let app = build_app(state);
@@ -52,6 +56,10 @@ async fn main() {
 #[cfg(target_os = "freebsd")]
 #[tokio::main]
 async fn main() {
+    // First line in the log: which build this is. Deploys are bare rsynced binaries, so
+    // without this there is no way to tell from the outside what a server is running.
+    println!("{}", ferros3::build_stamp());
+
     let config = load_config().await;
     let state = build_state(&config);
     let app = build_app(state);

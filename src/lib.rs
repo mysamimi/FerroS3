@@ -27,6 +27,27 @@ use crate::handlers::list::list_objects;
 use crate::handlers::object::{delete_object, get_object, head_object, put_object};
 use crate::state::AppState;
 
+/// One-line build stamp, printed at startup and the first thing to check when a server
+/// misbehaves: it ties the running process back to the revision it was built from.
+/// The values are baked in by build.rs; any of them can read "unknown" if the build
+/// happened outside a git checkout.
+pub fn build_stamp() -> String {
+    let built = chrono::DateTime::from_timestamp(
+        env!("FERROS3_BUILD_EPOCH").parse::<i64>().unwrap_or(0),
+        0,
+    )
+    .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    .unwrap_or_else(|| "unknown".to_string());
+
+    format!(
+        "ferros3 {} | version {} | commit {} | built {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("FERROS3_GIT_DESCRIBE"),
+        env!("FERROS3_GIT_COMMIT"),
+        built,
+    )
+}
+
 pub async fn load_config() -> Config {
     let config_path = "config.yaml";
     let config_str = fs::read_to_string(config_path)

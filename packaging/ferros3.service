@@ -1,0 +1,35 @@
+[Unit]
+Description=ferros3 S3-compatible object storage server
+# The bucket paths live on local disks, but the server binds a specific address from
+# config.yaml, so wait for the network to actually be configured rather than merely up.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Load-bearing, not cosmetic: ferros3 reads "config.yaml" as a relative path, so it
+# resolves against the working directory. Without this the service starts in / and dies
+# with "Failed to read config.yaml".
+WorkingDirectory=/app
+ExecStart=/app/ferros3
+
+Restart=always
+RestartSec=5s
+
+# Logs go to the journal; read them with `journalctl -u ferros3`. SyslogIdentifier keeps
+# the tag stable so the filter does not depend on the binary's path.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ferros3
+
+# A file server holds one descriptor per connection plus the object being served; the
+# 1024 default is far too low.
+LimitNOFILE=65535
+
+# Deliberately no ProtectSystem=/PrivateTmp= hardening: these hosts run systemd 219
+# (CentOS 7), which predates most of it, and the service needs read access to the
+# storage mounts anyway. Revisit if these servers are ever upgraded.
+
+[Install]
+WantedBy=multi-user.target
