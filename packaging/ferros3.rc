@@ -49,7 +49,13 @@ ferros3_start()
     # cd first: ferros3 reads "config.yaml" as a relative path, and daemon(8) on this
     # release has no option to set a working directory for the child.
     cd "${ferros3_dir}" || err 1 "cannot cd to ${ferros3_dir}"
+    # -f detaches daemon(8)'s own stdin/stdout/stderr to /dev/null. Without it the
+    # supervisor inherits whatever started the service and holds those descriptors open
+    # forever, so `ssh host 'service ferros3 start'` never returns — it sits waiting for
+    # an EOF that only arrives when the server exits. It costs nothing here because the
+    # child's output is captured separately and forwarded to syslog by -S.
     /usr/sbin/daemon \
+        -f \
         -r \
         -P "${pidfile}" \
         -p "${child_pidfile}" \
