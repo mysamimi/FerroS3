@@ -22,6 +22,8 @@
 -   **Streaming Support**: Handles large file uploads and downloads (Range Requests) efficiently.
 -   **Cross-Platform**: Designed to run seamlessly on Linux, macOS, and **FreeBSD**.
 -   **Zero External DB**: Pure filesystem-backed storage.
+-   **Operational Safeguards**: Configurable request timeout (a hung storage mount fails the request instead of holding the connection) and configurable PUT `fsync` durability.
+-   **Build Stamp**: Every binary knows the revision it was built from and prints it on startup.
 
 ## 📦 Installation
 
@@ -34,6 +36,17 @@ git clone https://github.com/mysamimi/ferros3.git
 cd ferros3
 cargo build --release
 ```
+
+The build stamps the git revision and build time into the binary, and the server prints
+them as the first line of its log:
+
+```
+ferros3 0.1.0 | version v0.1.0-3-gabc1234 | commit abc123456789 | built 2026-09-06T12:00:00Z
+```
+
+When building outside a git checkout (for example inside a container that only has the
+sources), set `FERROS3_GIT_COMMIT` and `FERROS3_GIT_DESCRIBE` to fill in those values;
+otherwise they read `unknown`. A missing `git` never fails the build.
 
 ## 🛠️ Configuration
 
@@ -49,8 +62,14 @@ Example configuration:
 port: 8080
 endpoint: "0.0.0.0"
 verbose: true
+# Maximum number of entries in the object stat cache (older entries are evicted).
 cache_size: 10000
-# Fail a stalled request after this many seconds (0 disables). Uploads are exempt.
+# Fsync each uploaded object before acknowledging the PUT (default true). Set to false
+# to trade crash durability for PUT latency when this proxy is not the source of truth.
+fsync: true
+# Give up on a request that hasn't produced a response within this many seconds, so a
+# hung storage mount fails the request instead of holding the connection open forever.
+# Set to 0 to disable. Uploads (PUT/POST) and response-body streaming are not bounded.
 request_timeout_secs: 30
 auth:
   access_key: "YOUR_ACCESS_KEY"
@@ -59,6 +78,9 @@ buckets:
   - name: "my-bucket"
     storage: "/path/to/local/data"
 ```
+
+`config.yaml` is read as a **relative path**, so the server must be started from the
+directory that contains it. See [API.md](./API.md) for the full option reference.
 
 ## 📚 API Documentation
 
@@ -95,12 +117,55 @@ If you need to deploy FerroS3 to an older system (like FreeBSD 11.2 or older Tru
 
 We provide a dedicated Docker-based build pipeline and a small FreeBSD 11 compatibility shim for this target. Please see the [Legacy FreeBSD Build Guide](legacy-freebsd-build-osx.md) for detailed instructions.
 
+```bash
+make build-freebsd11   # or: ./build-freebsd11.sh
+```
+
+`build-freebsd11.sh` probes a list of Debian mirrors and builds the image against the
+fastest reachable, up-to-date one (`deb.debian.org` is unusably slow on some networks).
+Set `DEBIAN_MIRROR` and/or `DEBIAN_SECURITY_MIRROR` to skip the corresponding probe:
+
+```bash
+DEBIAN_MIRROR=https://deb.debian.org/debian ./build-freebsd11.sh
+```
+
 ## 🐳 Docker
 
 ```bash
 docker build -t ferros3 .
 docker run -p 8080:8080 -v ./config.yaml:/app/config.yaml -v ./data:/data ferros3
 ```
+
+## 🔧 Running as a Service
+
+Ready-to-use service units live in [packaging/](packaging/). Both assume the binary and
+its `config.yaml` sit together in `/app`, because the config path is relative.
+
+### Linux (systemd)
+
+```bash
+sudo install -D -m 755 target/release/ferros3 /app/ferros3
+sudo cp config.yaml /app/config.yaml
+sudo cp packaging/ferros3.service /etc/systemd/system/ferros3.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ferros3
+journalctl -u ferros3 -f
+```
+
+### FreeBSD (rc.d)
+
+```sh
+install -m 755 target/x86_64-unknown-freebsd/release/ferros3 /app/ferros3
+cp config.yaml /app/config.yaml
+cp packaging/ferros3.rc /usr/local/etc/rc.d/ferros3
+chmod 755 /usr/local/etc/rc.d/ferros3
+sysrc ferros3_enable=YES
+service ferros3 start
+```
+
+The rc script runs the server under `daemon(8)`, which restarts it if it exits and
+forwards its output to syslog under the `ferros3` tag. Optional `rc.conf` overrides:
+`ferros3_dir` (default `/app`) and `ferros3_user` (default `root`).
 
 ## 🧪 Testing
 
