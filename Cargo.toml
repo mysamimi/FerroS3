@@ -16,7 +16,6 @@ chrono = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
-md-5 = "0.10"
 quick-xml = { version = "0.36", features = ["serialize"] }
 bytes = "1.0"
 http = "1.0"
@@ -47,3 +46,6 @@ cc = "1.0"
 tokio = { version = "=1.35.1", features = ["full", "test-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tempfile = "3"
+# Only the Content-MD5 assertions in tests/ use this; the server computes ETags
+# with sha2 and never hashes with MD5 itself.
+md-5 = "0.10"
