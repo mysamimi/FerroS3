@@ -32,6 +32,13 @@ pub struct Config {
     /// body, which the timeout also does not cover.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// After a DELETE empties a directory, remove it and every empty directory above it
+    /// (default true). S3 has no folders, so clients delete a "directory" by deleting
+    /// each key under it — without this the emptied directory tree stays on disk forever.
+    /// Only ever removes directories that hold nothing. Set to false when something
+    /// outside FerroS3 depends on those directories continuing to exist.
+    #[serde(default = "default_prune_empty_dirs")]
+    pub prune_empty_dirs: bool,
     pub auth: Option<AuthConfig>,
     pub buckets: Vec<BucketConfig>,
 }
@@ -48,6 +55,10 @@ fn default_request_timeout_secs() -> u64 {
     30
 }
 
+fn default_prune_empty_dirs() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +71,6 @@ mod tests {
         assert!(config.fsync);
         assert_eq!(config.cache_size, 10000);
         assert_eq!(config.request_timeout_secs, 30);
+        assert!(config.prune_empty_dirs);
     }
 }

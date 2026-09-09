@@ -494,6 +494,7 @@ mod tests {
             cache_size: 10,
             fsync: true,
             request_timeout_secs: 30,
+            prune_empty_dirs: true,
             auth: None,
             buckets: vec![BucketConfig { name: bucket_name.to_string(), storage: storage_path.to_string() }],
         };

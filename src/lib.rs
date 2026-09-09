@@ -170,6 +170,7 @@ mod tests {
             cache_size: 8,
             fsync: true,
             request_timeout_secs: seconds,
+            prune_empty_dirs: true,
             auth: None,
             buckets: Vec::<BucketConfig>::new(),
         })
@@ -231,6 +232,7 @@ mod tests {
             cache_size: 8,
             fsync: true,
             request_timeout_secs: 30,
+            prune_empty_dirs: true,
             auth: None,
             buckets: vec![],
         };

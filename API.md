@@ -24,6 +24,7 @@ The runtime configuration is read from `config.yaml` in the current working dire
 | `cache_size` | integer | no | In-memory stat cache size. Defaults to `10000`. |
 | `fsync` | boolean | no | Fsync each uploaded object before acknowledging the PUT. Defaults to `true`. |
 | `request_timeout_secs` | integer | no | Seconds a request may take to produce a response before it fails with `504 RequestTimeout`. Defaults to `30`; `0` disables. Body-carrying requests (PUT/POST) and response-body streaming are exempt. |
+| `prune_empty_dirs` | boolean | no | Remove a directory left empty by a DELETE, and every empty directory above it, stopping at the bucket's storage directory. Defaults to `true`. Never removes a directory that still holds anything. |
 | `auth` | object | no | Enables request authentication when present. |
 | `auth.access_key` | string | yes, when `auth` exists | Access key used by simple auth and SigV4. |
 | `auth.secret_key` | string | yes, when `auth` exists | Secret key used by SigV4. |
@@ -265,6 +266,13 @@ Deletes an object.
 
 - The handler returns `204` even if the file is already missing.
 - Cache entries for the object are removed on delete.
+- Unless `prune_empty_dirs` is `false`, a directory the delete leaves empty is removed,
+  along with every empty directory above it, stopping at the bucket's storage directory.
+  A directory that still holds an object, a subdirectory, or an upload in progress is left
+  alone. S3 has no folders, so this is what keeps `aws s3 rm --recursive` from leaving an
+  empty directory tree behind on disk.
+- A key that names a directory (`DELETE /:bucket/logs/`) still returns `204` and never
+  deletes objects; with pruning enabled the directory itself is removed if it is empty.
 
 ### Example
 

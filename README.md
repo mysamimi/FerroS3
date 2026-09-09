@@ -23,6 +23,7 @@
 -   **Cross-Platform**: Designed to run seamlessly on Linux, macOS, and **FreeBSD**.
 -   **Zero External DB**: Pure filesystem-backed storage.
 -   **Operational Safeguards**: Configurable request timeout (a hung storage mount fails the request instead of holding the connection) and configurable PUT `fsync` durability.
+-   **Self-Cleaning Layout**: A DELETE that empties a directory removes it, and every empty directory above it, so deleting a "folder" leaves no skeleton behind on the storage mount.
 -   **Build Stamp**: Every binary knows the revision it was built from and prints it on startup.
 
 ## 📦 Installation
@@ -71,6 +72,10 @@ fsync: true
 # hung storage mount fails the request instead of holding the connection open forever.
 # Set to 0 to disable. Uploads (PUT/POST) and response-body streaming are not bounded.
 request_timeout_secs: 30
+# Remove a directory left empty by a DELETE, and every empty directory above it (default
+# true). Only ever removes empty directories; set to false if something outside FerroS3
+# depends on those directories existing.
+prune_empty_dirs: true
 auth:
   access_key: "YOUR_ACCESS_KEY"
   secret_key: "YOUR_SECRET_KEY"

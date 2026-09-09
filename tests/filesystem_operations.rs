@@ -20,6 +20,12 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with_pruning(true).await
+    }
+
+    /// `prune_empty_dirs` is the one config switch a test needs to flip, so it is the
+    /// only parameter: everything else stays identical to `start()`.
+    async fn start_with_pruning(prune_empty_dirs: bool) -> Self {
         let storage_dir = TempDir::new().unwrap();
         let source_dir = TempDir::new().unwrap();
         let bucket = "test-bucket".to_string();
@@ -33,6 +39,7 @@ impl TestServer {
             cache_size: 32,
             fsync: true,
             request_timeout_secs: 30,
+            prune_empty_dirs,
             auth: Some(AuthConfig {
                 access_key: "test_key".to_string(),
                 secret_key: "test_secret".to_string(),
@@ -58,6 +65,12 @@ impl TestServer {
             client: Client::new(),
             handle,
         }
+    }
+
+    /// The bucket's directory on disk. Listing hides empty directories, so a test about
+    /// directories left behind has to look at the filesystem, not at the API.
+    fn storage_path(&self) -> &std::path::Path {
+        self._storage_dir.path()
     }
 
     fn object_url(&self, key: &str) -> String {
@@ -655,4 +668,63 @@ async fn responses_use_http_date_and_advertise_accept_ranges() {
             .map(|v| v.to_str().unwrap());
         assert_eq!(accept_ranges, Some("bytes"), "{method} missing Accept-Ranges");
     }
+}
+
+#[tokio::test]
+async fn deleting_the_last_object_removes_the_directories_it_emptied() {
+    // S3 has no folders: a client clears a "folder" by deleting each key under it. The
+    // directories it leaves behind are invisible to listing but stay on the storage mount.
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("deep.txt");
+    fs::write(&source_file, b"deep").await.unwrap();
+    server.write("prune/a/b/c.txt", &source_file).await;
+    assert!(server.storage_path().join("prune/a/b").is_dir());
+
+    server.delete("prune/a/b/c.txt").await;
+
+    assert!(
+        !server.storage_path().join("prune").exists(),
+        "the whole emptied chain should be gone from disk"
+    );
+    assert!(
+        server.storage_path().is_dir(),
+        "the bucket's own storage directory must survive"
+    );
+}
+
+#[tokio::test]
+async fn pruning_keeps_directories_that_still_hold_objects() {
+    let server = TestServer::start().await;
+    let source_file = server._source_dir.path().join("sib.txt");
+    fs::write(&source_file, b"sibling").await.unwrap();
+    server.write("keep/one.txt", &source_file).await;
+    server.write("keep/nested/two.txt", &source_file).await;
+
+    server.delete("keep/nested/two.txt").await;
+
+    assert!(
+        !server.storage_path().join("keep/nested").exists(),
+        "the emptied subdirectory should be pruned"
+    );
+    assert!(
+        server.storage_path().join("keep/one.txt").exists(),
+        "a directory holding a sibling object must not be touched"
+    );
+    assert_eq!(server.read("keep/one.txt").await, b"sibling".to_vec());
+}
+
+#[tokio::test]
+async fn pruning_can_be_turned_off_from_the_config() {
+    // Some storage mounts are shared with other systems that expect a directory to exist.
+    let server = TestServer::start_with_pruning(false).await;
+    let source_file = server._source_dir.path().join("stay.txt");
+    fs::write(&source_file, b"stay").await.unwrap();
+    server.write("stays/a/b.txt", &source_file).await;
+
+    server.delete("stays/a/b.txt").await;
+
+    assert!(
+        server.storage_path().join("stays/a").is_dir(),
+        "prune_empty_dirs: false must leave the directory tree alone"
+    );
 }

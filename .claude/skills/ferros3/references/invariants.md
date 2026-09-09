@@ -66,6 +66,20 @@ reading the source — a self-copy would zero the object. S3 refuses it too. Tes
 post-copy metadata so a following HEAD/GET agrees. Tested by
 `copy_object_result_etag_matches_destination_head`.
 
+**Directory pruning can only ever remove empty directories.** `prune_empty_dirs`
+(`handlers/object.rs`) walks upward from a deleted object with `fs::remove_dir` — never
+`remove_dir_all` — so the first directory still holding anything (a sibling object, a
+subdirectory, a PUT's temp file) ends the walk. It stops at the bucket's storage root,
+which is configuration and is never removed. Gate any change here on
+`prune_never_removes_the_bucket_root` and
+`pruning_keeps_directories_that_still_hold_objects`.
+
+**Writes retry once against a pruned directory.** Pruning is what makes it possible for a
+directory to disappear between a write's `create_dir_all` and the write itself, so
+`put_object` and `copy_object` recreate the parent and retry once rather than returning a
+spurious 500. Removing the retry reintroduces a race that only shows up under concurrent
+`aws s3 sync --delete`.
+
 **A file that vanishes mid-listing is skipped, not fatal.** `collect_entries` uses
 `symlink_metadata` and `continue`s on error — a concurrent DELETE between readdir and stat
 must not kill the listing. Symlinks are reported as objects, never followed.

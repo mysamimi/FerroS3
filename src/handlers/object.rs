@@ -251,10 +251,8 @@ pub async fn put_object(
     }
 
     // Create parent directories
-    if let Some(parent) = path.parent() {
-        if fs::create_dir_all(parent).await.is_err() {
-            return S3ErrorType::InternalError.to_response(None);
-        }
+    if !ensure_parent_dir(&path).await {
+        return S3ErrorType::InternalError.to_response(None);
     }
 
     // Write to a temporary file in the destination directory, then atomically rename
@@ -262,7 +260,7 @@ pub async fn put_object(
     // succeeds, so an aborted or failed PUT never truncates or partially overwrites
     // existing data, and concurrent PUTs to the same key can't interleave.
     let temp_path = temp_path_for(&path);
-    let mut file = match File::create(&temp_path).await {
+    let mut file = match create_retrying_on_pruned_dir(&path, &temp_path).await {
         Ok(f) => f,
         Err(_) => return S3ErrorType::InternalError.to_response(None),
     };
@@ -331,6 +329,35 @@ pub async fn put_object(
         .unwrap()
 }
 
+/// Create `path`'s parent directory. Returns false only if it could not be created.
+async fn ensure_parent_dir(path: &std::path::Path) -> bool {
+    match path.parent() {
+        Some(parent) => fs::create_dir_all(parent).await.is_ok(),
+        None => true,
+    }
+}
+
+/// Create `temp_path`, recreating the destination directory and retrying once.
+///
+/// Empty-directory pruning is what makes that retry necessary: a DELETE removing the last
+/// object of a directory can prune it between this write's `create_dir_all` and the create
+/// below, and the upload would fail with a spurious 500. The window is small but real —
+/// `aws s3 sync --delete` writes and deletes in the same tree concurrently.
+async fn create_retrying_on_pruned_dir(
+    path: &std::path::Path,
+    temp_path: &std::path::Path,
+) -> io::Result<File> {
+    match File::create(temp_path).await {
+        Ok(file) => Ok(file),
+        Err(err) => {
+            if !ensure_parent_dir(path).await {
+                return Err(err);
+            }
+            File::create(temp_path).await
+        }
+    }
+}
+
 /// Build a unique temporary path in the same directory as `path`, so a subsequent
 /// rename onto `path` is atomic (same filesystem). Hidden (dot-prefixed) and suffixed
 /// with pid + a monotonic counter to avoid collisions between concurrent uploads.
@@ -387,14 +414,18 @@ async fn copy_object(
         }
     }
 
-    if let Some(parent) = destination_path.parent() {
-        if fs::create_dir_all(parent).await.is_err() {
-            return S3ErrorType::InternalError.to_response(None);
-        }
+    if !ensure_parent_dir(destination_path).await {
+        return S3ErrorType::InternalError.to_response(None);
     }
 
     if fs::copy(&source_path, destination_path).await.is_err() {
-        return S3ErrorType::InternalError.to_response(None);
+        // Same pruned-directory race as PUT: recreate the destination directory and try
+        // once more before calling it a server error.
+        if !ensure_parent_dir(destination_path).await
+            || fs::copy(&source_path, destination_path).await.is_err()
+        {
+            return S3ErrorType::InternalError.to_response(None);
+        }
     }
 
     state
@@ -448,13 +479,54 @@ pub async fn delete_object(
         Some(p) => p,
         None => return S3ErrorType::AccessDenied.to_response(Some(key)),
     };
-    if fs::remove_file(&path).await.is_err() {
-        // S3 returns 204 even if file doesn't exist during DELETE
-        return StatusCode::NO_CONTENT.into_response();
+    // S3 returns 204 even if the file doesn't exist during DELETE, so a failure here is
+    // not an error — but it does change where the prune below starts.
+    let removed = fs::remove_file(&path).await.is_ok();
+    if removed {
+        state.cache.remove(&format!("{}/{}", bucket, key));
     }
 
-    state.cache.remove(&format!("{}/{}", bucket, key));
+    if state.config.prune_empty_dirs {
+        // On the normal path the object is gone and its directory may now be empty, so
+        // start at the parent. When `remove_file` failed the key may have named a
+        // directory (`DELETE /bucket/logs/`), so start at the path itself and let an
+        // emptied directory be collected too. `remove_dir` refuses a non-empty directory
+        // either way, so neither start can destroy anything.
+        let start = if removed { path.parent() } else { Some(path.as_path()) };
+        if let Some(start) = start {
+            prune_empty_dirs(storage, start).await;
+        }
+    }
+
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Remove `from` and each empty directory above it, stopping at `root` — the bucket's
+/// storage directory, which is never removed however empty the bucket becomes.
+///
+/// S3 has no directories: a client "deletes a folder" by deleting every key under it, and
+/// without this the emptied directory tree stays on disk forever. Listing hides those
+/// directories (`subtree_has_file`), so they are invisible over the API and accumulate
+/// unnoticed on the storage mount.
+///
+/// This cannot delete data. `remove_dir` — never `remove_dir_all` — succeeds only on an
+/// empty directory, so the first directory still holding anything ends the walk: a
+/// sibling object, a subdirectory, or the temp file of a PUT in flight. Errors are
+/// ignored for the same reason the delete's own error is: the object is gone, and a
+/// leftover directory is not worth failing a 204 over.
+async fn prune_empty_dirs(root: &std::path::Path, from: &std::path::Path) {
+    let mut dir = from;
+    // `safe_join` guarantees `from` sits under `root`; `starts_with` keeps that true for
+    // every step, so a surprising path can't walk the parent chain out of the bucket.
+    while dir != root && dir.starts_with(root) {
+        if fs::remove_dir(dir).await.is_err() {
+            return;
+        }
+        dir = match dir.parent() {
+            Some(parent) => parent,
+            None => return,
+        };
+    }
 }
 
 enum RangeRequest {
@@ -638,5 +710,43 @@ mod tests {
             safe_join(storage, "C:/Windows/System32").unwrap(),
             Path::new("/var/data/C:/Windows/System32")
         );
+    }
+
+    #[tokio::test]
+    async fn prune_walks_up_the_whole_emptied_chain() {
+        // The shape a client leaves behind after deleting the last key under a prefix.
+        let root = tempfile::TempDir::new().unwrap();
+        let deepest = root.path().join("a/b/c");
+        std::fs::create_dir_all(&deepest).unwrap();
+
+        prune_empty_dirs(root.path(), &deepest).await;
+
+        assert!(!root.path().join("a").exists(), "the emptied tree should be gone");
+        assert!(root.path().exists(), "the bucket's storage directory must survive");
+    }
+
+    #[tokio::test]
+    async fn prune_stops_at_a_directory_that_still_holds_something() {
+        // `a/` keeps a sibling object, so only the empty `a/b` may go.
+        let root = tempfile::TempDir::new().unwrap();
+        let empty = root.path().join("a/b");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(root.path().join("a/keep.txt"), b"data").unwrap();
+
+        prune_empty_dirs(root.path(), &empty).await;
+
+        assert!(!empty.exists(), "the empty directory should be pruned");
+        assert!(root.path().join("a/keep.txt").exists(), "a sibling object must survive");
+    }
+
+    #[tokio::test]
+    async fn prune_never_removes_the_bucket_root() {
+        // Deleting the last object in a bucket empties the storage directory itself; it
+        // is configuration, not data, and must stay.
+        let root = tempfile::TempDir::new().unwrap();
+
+        prune_empty_dirs(root.path(), root.path()).await;
+
+        assert!(root.path().exists());
     }
 }

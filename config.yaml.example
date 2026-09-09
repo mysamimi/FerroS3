@@ -10,6 +10,10 @@ fsync: true
 # hung storage mount fails the request instead of holding the connection open forever.
 # Set to 0 to disable. Uploads (PUT/POST) and response-body streaming are not bounded.
 request_timeout_secs: 30
+# Remove a directory left empty by a DELETE, and every empty directory above it (default
+# true). S3 has no folders, so clients clear one by deleting each key under it; without
+# this the emptied directory tree stays on disk. Only ever removes empty directories.
+prune_empty_dirs: true
 auth:
   access_key: "YOUR_ACCESS_KEY"
   secret_key: "YOUR_SECRET_KEY"

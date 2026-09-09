@@ -41,7 +41,9 @@ need a part store and a manifest, which is a genuine design change, not a handle
   they are used as an *exclusive* start for both `marker` (v1) and `continuation-token`
   (v2). `NextMarker`/`NextContinuationToken` are only emitted when truncated.
 - **A key ending in `/` is not a directory marker.** Directories exist implicitly; empty
-  directories are excluded from listings entirely (`subtree_has_file`).
+  directories are excluded from listings entirely (`subtree_has_file`), and — unless
+  `prune_empty_dirs` is off — a DELETE that empties one removes it from disk along with
+  every empty directory above it.
 - **Symlinks are listed as objects** and are not followed by the listing walk.
 - **Delimiters other than `/` work**, including a delimiter that falls inside a filename
   (`a-1.txt` collapsing at `-`) — that path is separate from the fast `/`-collapse.
