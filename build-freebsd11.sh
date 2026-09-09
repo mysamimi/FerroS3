@@ -141,9 +141,38 @@ docker build -t "$IMAGE" -f Dockerfile.freebsd11 \
     --build-arg "DEBIAN_SECURITY_MIRROR=$DEBIAN_SECURITY_MIRROR" \
     .
 
+# The container resolves dependencies from scratch, so it must not inherit the host's
+# Cargo.lock. But the checkout is bind-mounted at /app: deleting that lock from inside the
+# container deletes the developer's own file, and the container (running as root) writes
+# its replacement back as a root-owned file — which on Linux then breaks the next
+# unprivileged `cargo build` in the same checkout.
+#
+# So the host owns the swap instead: stash the lock, hand the container a clean tree, and
+# put the original back on the way out, whether the build succeeded or not. Building for
+# FreeBSD now leaves the host's dependency resolution exactly as it found it, instead of
+# silently re-resolving every crate the next time anything is built here.
+HOST_LOCK_BACKUP=""
+
+restore_host_lock() {
+    # A root-owned lock left by the container is still removable: unlinking needs write
+    # permission on the directory, not on the file.
+    rm -f Cargo.lock
+    if [ -n "$HOST_LOCK_BACKUP" ]; then
+        mv "$HOST_LOCK_BACKUP" Cargo.lock
+    fi
+    return 0
+}
+
+if [ -f Cargo.lock ]; then
+    HOST_LOCK_BACKUP=$(mktemp "${TMPDIR:-/tmp}/ferros3-Cargo.lock.XXXXXX")
+    cp Cargo.lock "$HOST_LOCK_BACKUP"
+fi
+trap restore_host_lock EXIT
+rm -f Cargo.lock
+
 echo "Compiling the project inside Docker..."
 docker run --rm -v "$(pwd):/app" "$IMAGE" \
-    bash -c "rm -f /app/Cargo.lock && cargo build --release --target x86_64-unknown-freebsd -Z build-std"
+    cargo build --release --target x86_64-unknown-freebsd -Z build-std
 
 BINARY="target/x86_64-unknown-freebsd/release/ferros3"
 if [ ! -f "$BINARY" ]; then
