@@ -252,7 +252,7 @@ pub async fn put_object(
 
     // Create parent directories
     if let Some(parent) = path.parent() {
-        if let Err(_) = fs::create_dir_all(parent).await {
+        if fs::create_dir_all(parent).await.is_err() {
             return S3ErrorType::InternalError.to_response(None);
         }
     }
@@ -388,12 +388,12 @@ async fn copy_object(
     }
 
     if let Some(parent) = destination_path.parent() {
-        if let Err(_) = fs::create_dir_all(parent).await {
+        if fs::create_dir_all(parent).await.is_err() {
             return S3ErrorType::InternalError.to_response(None);
         }
     }
 
-    if let Err(_) = fs::copy(&source_path, destination_path).await {
+    if fs::copy(&source_path, destination_path).await.is_err() {
         return S3ErrorType::InternalError.to_response(None);
     }
 
@@ -448,7 +448,7 @@ pub async fn delete_object(
         Some(p) => p,
         None => return S3ErrorType::AccessDenied.to_response(Some(key)),
     };
-    if let Err(_) = fs::remove_file(&path).await {
+    if fs::remove_file(&path).await.is_err() {
         // S3 returns 204 even if file doesn't exist during DELETE
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -516,67 +516,6 @@ fn parse_range(range_header: &str, file_size: u64) -> RangeRequest {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn test_parse_range() {
-        // Normal ranges
-        assert!(matches!(parse_range("bytes=0-499", 1000), RangeRequest::Satisfiable(0, 499)));
-        assert!(matches!(parse_range("bytes=500-", 1000), RangeRequest::Satisfiable(500, 999)));
-        
-        // Suffix ranges
-        assert!(matches!(parse_range("bytes=-500", 1000), RangeRequest::Satisfiable(500, 999)));
-        assert!(matches!(parse_range("bytes=-1500", 1000), RangeRequest::Satisfiable(0, 999)));
-
-        // Unsatisfiable
-        assert!(matches!(parse_range("bytes=1000-", 1000), RangeRequest::Unsatisfiable));
-        assert!(matches!(parse_range("bytes=9999-", 1000), RangeRequest::Unsatisfiable));
-        
-        // Zero length files
-        assert!(matches!(parse_range("bytes=-500", 0), RangeRequest::Unsatisfiable));
-        assert!(matches!(parse_range("bytes=0-", 0), RangeRequest::Unsatisfiable));
-
-        // Invalid ranges
-        assert!(matches!(parse_range("bytes=abc-def", 1000), RangeRequest::Invalid));
-        assert!(matches!(parse_range("bytes=-", 1000), RangeRequest::Invalid));
-        assert!(matches!(parse_range("bytes=500-499", 1000), RangeRequest::Invalid));
-        assert!(matches!(parse_range("wrong=0-100", 1000), RangeRequest::Invalid));
-    }
-
-    #[test]
-    fn test_safe_join() {
-        let storage = Path::new("/var/data");
-
-        // Normal keys
-        assert_eq!(safe_join(storage, "my_file.txt").unwrap(), Path::new("/var/data/my_file.txt"));
-        assert_eq!(safe_join(storage, "folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
-
-        // Leading slashes are ignored (RootDir)
-        assert_eq!(safe_join(storage, "/folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
-
-        // Current dir dots are ignored
-        assert_eq!(safe_join(storage, "./folder/./file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
-
-        // ParentDir traversal is rejected
-        assert!(safe_join(storage, "../etc/passwd").is_none());
-        assert!(safe_join(storage, "folder/../../etc/passwd").is_none());
-
-        // Windows drive prefixes are only parsed as `Prefix` components on Windows,
-        // where they are rejected. On Unix a string like "C:/..." is just a normal
-        // (contained) key, so it resolves safely inside storage instead.
-        #[cfg(windows)]
-        assert!(safe_join(storage, "C:/Windows/System32").is_none());
-        #[cfg(not(windows))]
-        assert_eq!(
-            safe_join(storage, "C:/Windows/System32").unwrap(),
-            Path::new("/var/data/C:/Windows/System32")
-        );
-    }
-}
-
 /// Format a UTC timestamp as an HTTP-date (RFC 7231 IMF-fixdate), e.g.
 /// "Sun, 06 Nov 1994 08:49:37 GMT". `DateTime::to_rfc2822` emits a "+0000" offset
 /// instead of "GMT", which is not a valid HTTP-date and is rejected by strict clients.
@@ -639,4 +578,65 @@ fn safe_join(storage: &std::path::Path, key: &str) -> Option<std::path::PathBuf>
         }
     }
     Some(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_parse_range() {
+        // Normal ranges
+        assert!(matches!(parse_range("bytes=0-499", 1000), RangeRequest::Satisfiable(0, 499)));
+        assert!(matches!(parse_range("bytes=500-", 1000), RangeRequest::Satisfiable(500, 999)));
+        
+        // Suffix ranges
+        assert!(matches!(parse_range("bytes=-500", 1000), RangeRequest::Satisfiable(500, 999)));
+        assert!(matches!(parse_range("bytes=-1500", 1000), RangeRequest::Satisfiable(0, 999)));
+
+        // Unsatisfiable
+        assert!(matches!(parse_range("bytes=1000-", 1000), RangeRequest::Unsatisfiable));
+        assert!(matches!(parse_range("bytes=9999-", 1000), RangeRequest::Unsatisfiable));
+        
+        // Zero length files
+        assert!(matches!(parse_range("bytes=-500", 0), RangeRequest::Unsatisfiable));
+        assert!(matches!(parse_range("bytes=0-", 0), RangeRequest::Unsatisfiable));
+
+        // Invalid ranges
+        assert!(matches!(parse_range("bytes=abc-def", 1000), RangeRequest::Invalid));
+        assert!(matches!(parse_range("bytes=-", 1000), RangeRequest::Invalid));
+        assert!(matches!(parse_range("bytes=500-499", 1000), RangeRequest::Invalid));
+        assert!(matches!(parse_range("wrong=0-100", 1000), RangeRequest::Invalid));
+    }
+
+    #[test]
+    fn test_safe_join() {
+        let storage = Path::new("/var/data");
+
+        // Normal keys
+        assert_eq!(safe_join(storage, "my_file.txt").unwrap(), Path::new("/var/data/my_file.txt"));
+        assert_eq!(safe_join(storage, "folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // Leading slashes are ignored (RootDir)
+        assert_eq!(safe_join(storage, "/folder/file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // Current dir dots are ignored
+        assert_eq!(safe_join(storage, "./folder/./file.txt").unwrap(), Path::new("/var/data/folder/file.txt"));
+
+        // ParentDir traversal is rejected
+        assert!(safe_join(storage, "../etc/passwd").is_none());
+        assert!(safe_join(storage, "folder/../../etc/passwd").is_none());
+
+        // Windows drive prefixes are only parsed as `Prefix` components on Windows,
+        // where they are rejected. On Unix a string like "C:/..." is just a normal
+        // (contained) key, so it resolves safely inside storage instead.
+        #[cfg(windows)]
+        assert!(safe_join(storage, "C:/Windows/System32").is_none());
+        #[cfg(not(windows))]
+        assert_eq!(
+            safe_join(storage, "C:/Windows/System32").unwrap(),
+            Path::new("/var/data/C:/Windows/System32")
+        );
+    }
 }
