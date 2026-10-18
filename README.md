@@ -65,6 +65,9 @@ endpoint: "0.0.0.0"
 verbose: true
 # Maximum number of entries in the object stat cache (older entries are evicted).
 cache_size: 10000
+# Seconds a cached HEAD result is trusted before the file is re-statted (default 30; 0
+# disables the stat cache). Writes and deletes through FerroS3 invalidate immediately.
+stat_cache_ttl_secs: 30
 # Fsync each uploaded object before acknowledging the PUT (default true). Set to false
 # to trade crash durability for PUT latency when this proxy is not the source of truth.
 fsync: true

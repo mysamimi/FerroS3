@@ -7,7 +7,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::fs::{self, File};
 use tokio::io::{self, AsyncSeekExt, AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
@@ -166,7 +166,8 @@ pub async fn head_object(
     };
 
     let cache_key = format!("{}/{}", bucket, key);
-    if let Some(cached) = state.cache.get(&cache_key) {
+    let ttl = Duration::from_secs(state.config.stat_cache_ttl_secs);
+    if let Some(cached) = state.cache.get(&cache_key).filter(|c| c.cached_at.elapsed() < ttl) {
         return Response::builder()
             .header(header::CONTENT_LENGTH, cached.size)
             .header(header::ACCEPT_RANGES, "bytes")
@@ -202,6 +203,7 @@ pub async fn head_object(
         size,
         mod_time,
         etag: etag.clone(),
+        cached_at: Instant::now(),
     });
 
     Response::builder()
@@ -315,7 +317,12 @@ pub async fn put_object(
             );
             state.cache.insert(
                 format!("{}/{}", bucket, key),
-                CachedStat { size: metadata.len(), mod_time, etag: etag.clone() },
+                CachedStat {
+                    size: metadata.len(),
+                    mod_time,
+                    etag: etag.clone(),
+                    cached_at: Instant::now(),
+                },
             );
             etag
         }

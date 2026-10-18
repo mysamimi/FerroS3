@@ -22,6 +22,7 @@ The runtime configuration is read from `config.yaml` in the current working dire
 | `endpoint` | string | yes | Interface/address to bind. |
 | `verbose` | boolean | yes | Enables request logging in the auth middleware. |
 | `cache_size` | integer | no | In-memory stat cache size. Defaults to `10000`. |
+| `stat_cache_ttl_secs` | integer | no | Seconds a cached HEAD result is served before the file is re-statted. Defaults to `30`; `0` disables the stat cache. Writes and deletes through FerroS3 invalidate the entry immediately. |
 | `fsync` | boolean | no | Fsync each uploaded object before acknowledging the PUT. Defaults to `true`. |
 | `request_timeout_secs` | integer | no | Seconds a request may take to produce a response before it fails with `504 RequestTimeout`. Defaults to `30`; `0` disables. Body-carrying requests (PUT/POST) and response-body streaming are exempt. |
 | `prune_empty_dirs` | boolean | no | Remove a directory left empty by a DELETE, and every empty directory above it, stopping at the bucket's storage directory. Defaults to `true`. Never removes a directory that still holds anything. |

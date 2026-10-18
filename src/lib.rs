@@ -160,6 +160,7 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::put;
     use chrono::Utc;
+    use std::time::{Duration, Instant};
     use tower::ServiceExt;
 
     fn timeout_state(seconds: u64) -> Arc<AppState> {
@@ -171,6 +172,7 @@ mod tests {
             fsync: true,
             request_timeout_secs: seconds,
             prune_empty_dirs: true,
+            stat_cache_ttl_secs: 30,
             auth: None,
             buckets: Vec::<BucketConfig>::new(),
         })
@@ -233,6 +235,7 @@ mod tests {
             fsync: true,
             request_timeout_secs: 30,
             prune_empty_dirs: true,
+            stat_cache_ttl_secs: 30,
             auth: None,
             buckets: vec![],
         };
@@ -243,7 +246,7 @@ mod tests {
         for i in 0..1000 {
             state.cache.insert(
                 format!("bucket/key-{i}"),
-                CachedStat { size: i, mod_time: Utc::now(), etag: format!("\"{i}\"") },
+                CachedStat { size: i, mod_time: Utc::now(), etag: format!("\"{i}\""), cached_at: Instant::now() },
             );
         }
         assert!(
@@ -251,5 +254,61 @@ mod tests {
             "cache exceeded its bound: {} entries",
             state.cache.len()
         );
+    }
+
+    /// State with one bucket rooted at `dir` and the given stat-cache TTL.
+    fn head_state(dir: &std::path::Path, ttl_secs: u64) -> Arc<AppState> {
+        build_state(&Config {
+            port: 0,
+            endpoint: String::new(),
+            verbose: false,
+            cache_size: 8,
+            stat_cache_ttl_secs: ttl_secs,
+            fsync: true,
+            request_timeout_secs: 30,
+            prune_empty_dirs: true,
+            auth: None,
+            buckets: vec![BucketConfig {
+                name: "b".to_string(),
+                storage: dir.to_string_lossy().into_owned(),
+            }],
+        })
+    }
+
+    async fn head_content_length(state: Arc<AppState>, key: &str) -> String {
+        let request = Request::builder()
+            .method("HEAD")
+            .uri(format!("/b/{key}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = build_api_router(state).oneshot(request).await.unwrap();
+        response.headers()["content-length"].to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn head_serves_cached_stat_within_ttl() {
+        // The file on disk is 5 bytes; a fresh cache entry claiming 999 must win.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("k.txt"), b"hello").unwrap();
+        let state = head_state(dir.path(), 30);
+        state.cache.insert(
+            "b/k.txt".to_string(),
+            CachedStat { size: 999, mod_time: Utc::now(), etag: "\"x\"".into(), cached_at: Instant::now() },
+        );
+        assert_eq!(head_content_length(state, "k.txt").await, "999");
+    }
+
+    #[tokio::test]
+    async fn head_restats_entry_older_than_ttl() {
+        // An entry stored 60s ago is past the 30s TTL, so HEAD must re-stat the file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("k.txt"), b"hello").unwrap();
+        let state = head_state(dir.path(), 30);
+        let stored_at = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        state.cache.insert(
+            "b/k.txt".to_string(),
+            CachedStat { size: 999, mod_time: Utc::now(), etag: "\"x\"".into(), cached_at: stored_at },
+        );
+        assert_eq!(head_content_length(state, "k.txt").await, "5");
     }
 }

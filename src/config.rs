@@ -19,6 +19,11 @@ pub struct Config {
     pub verbose: bool,
     #[serde(default = "default_cache_size")]
     pub cache_size: usize,
+    /// Seconds a cached HEAD result stays valid before the file is re-statted (default
+    /// 30; 0 disables the stat cache). Bounds how stale a HEAD can be after the file is
+    /// changed outside FerroS3. Writes and deletes through FerroS3 invalidate immediately.
+    #[serde(default = "default_stat_cache_ttl_secs")]
+    pub stat_cache_ttl_secs: u64,
     /// Fsync each uploaded object before acknowledging the PUT (default true). Set to
     /// false to trade crash durability for PUT latency, e.g. when the proxy fronts a
     /// cache or replica rather than the source of truth.
@@ -47,6 +52,10 @@ fn default_cache_size() -> usize {
     10000
 }
 
+fn default_stat_cache_ttl_secs() -> u64 {
+    30
+}
+
 fn default_fsync() -> bool {
     true
 }
@@ -70,6 +79,7 @@ mod tests {
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.fsync);
         assert_eq!(config.cache_size, 10000);
+        assert_eq!(config.stat_cache_ttl_secs, 30);
         assert_eq!(config.request_timeout_secs, 30);
         assert!(config.prune_empty_dirs);
     }

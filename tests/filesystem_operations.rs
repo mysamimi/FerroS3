@@ -37,6 +37,7 @@ impl TestServer {
             endpoint: "127.0.0.1".to_string(),
             verbose: false,
             cache_size: 32,
+            stat_cache_ttl_secs: 30,
             fsync: true,
             request_timeout_secs: 30,
             prune_empty_dirs,
